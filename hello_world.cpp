@@ -4,11 +4,32 @@
 #include <string>
 #include <cstdint>
 #include <iomanip>
+#include <cstring>
 #include <SDL3/SDL.h>
 
 // Dimensiones de la Game Boy
 const int SCREEN_WIDTH = 160;
 const int SCREEN_HEIGHT = 144;
+
+// Direcciones de Registros I/O comunes
+enum IORegisters : uint16_t {
+    REG_JOYP = 0xFF00, REG_SB   = 0xFF01, REG_SC   = 0xFF02,
+    REG_DIV  = 0xFF04, REG_TIMA = 0xFF05, REG_TMA  = 0xFF06, REG_TAC  = 0xFF07,
+    REG_IF   = 0xFF0F,
+    REG_LCDC = 0xFF40, REG_STAT = 0xFF41, REG_SCY  = 0xFF42, REG_SCX  = 0xFF43,
+    REG_LY   = 0xFF44, REG_LYC  = 0xFF45, REG_DMA  = 0xFF46,
+    REG_BGP  = 0xFF47, REG_OBP0 = 0xFF48, REG_OBP1 = 0xFF49,
+    REG_WY   = 0xFF4A, REG_WX   = 0xFF4B,
+    REG_IE   = 0xFFFF
+};
+
+// Modos de la PPU
+enum PPUMode {
+    MODE_HBLANK = 0,
+    MODE_VBLANK = 1,
+    MODE_OAM    = 2,
+    MODE_VRAM   = 3
+};
 
 // ===================== CLASE CPU Z80 SIMPLIFICADA =====================
 class CPU {
@@ -28,16 +49,16 @@ public:
     bool ime;           // Master Interrupt Enable
     int ei_delay;       // Retraso para la instrucción EI
 
-    CPU() : A(0), B(0), C(0), D(0), E(0), H(0), L(0), 
+    CPU() : A(0x01), B(0), C(0x13), D(0), E(0xD8), H(0x01), L(0x4D), 
             SP(0xFFFE), PC(0x0100), 
-            flagZ(0), flagN(0), flagH(0), flagC(0),
+            flagZ(1), flagN(0), flagH(1), flagC(1),
             cycles(0), halted(false), ime(false), ei_delay(0) {}
 
     // Pares de registros como direcciones de 16 bits
     uint16_t getBC() const { return (static_cast<uint16_t>(B) << 8) | C; }
     uint16_t getDE() const { return (static_cast<uint16_t>(D) << 8) | E; }
     uint16_t getHL() const { return (static_cast<uint16_t>(H) << 8) | L; }
-    uint16_t getAF() const { 
+    uint16_t getAF() const {
         return (static_cast<uint16_t>(A) << 8) | ((flagZ << 7) | (flagN << 6) | (flagH << 5) | (flagC << 4));
     }
 
@@ -53,30 +74,11 @@ public:
         flagC = (f >> 4) & 1;
     }
 
-    // Setear flags basado en operaciones
+    // Setear flags basado en operaciones (Re-agregado para XOR/OR)
     void setFlagsZN(uint8_t result) {
         flagZ = (result == 0) ? 1 : 0;
         flagN = 0;
         flagH = 0;
-    }
-
-    void printState() {
-        std::cout << std::hex << std::setfill('0')
-                  << "PC=" << std::setw(4) << PC
-                  << " SP=" << std::setw(4) << SP
-                  << " A=" << std::setw(2) << (int)A
-                  << " B=" << std::setw(2) << (int)B
-                  << " C=" << std::setw(2) << (int)C
-                  << " D=" << std::setw(2) << (int)D
-                  << " E=" << std::setw(2) << (int)E
-                  << " H=" << std::setw(2) << (int)H
-                  << " L=" << std::setw(2) << (int)L
-                  << " FLAGS=" << std::setw(1) << (int)flagZ 
-                  << std::setw(1) << (int)flagN 
-                  << std::setw(1) << (int)flagH 
-                  << std::setw(1) << (int)flagC
-                  << " Halted=" << (halted ? "Yes" : "No")
-                  << std::dec << std::endl;
     }
 };
 
@@ -87,20 +89,42 @@ private:
     SDL_Renderer* renderer;
     SDL_Texture* texture;
     uint32_t pixels[SCREEN_WIDTH * SCREEN_HEIGHT];
+    uint32_t colors[4]; // Paleta de colores parametrizada
 
 public:
     uint8_t ly;        // Scanline actual (0xFF44)
     uint8_t stat;      // PPU Status (0xFF41)
+    uint8_t bgp, obp0, obp1; // Paletas (0xFF47, 0xFF48, 0xFF49)
     uint8_t lcdc;      // LCD Control (0xFF40)
     uint8_t scy, scx;  // Scroll Y, X
+    uint8_t wy, wx;    // Window Y, X (0xFF4A, 0xFF4B)
     int cycles_count;  // Contador para sincronizar con la CPU
+    int window_line_counter; // Contador interno para la Window
 
-    PPU() : ly(0), stat(0), lcdc(0x91), scy(0), scx(0), cycles_count(456) {
-        SDL_Init(SDL_INIT_VIDEO);
-        window = SDL_CreateWindow("Gemini GameBoy", SCREEN_WIDTH * 3, SCREEN_HEIGHT * 3, 0);
+    PPU() : ly(0), stat(0), bgp(0xFC), obp0(0xFF), obp1(0xFF), lcdc(0x91), scy(0), scx(0), wy(0), wx(0), cycles_count(456), window_line_counter(0) {
+        SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+        window = SDL_CreateWindow("GameBoy", SCREEN_WIDTH * 3, SCREEN_HEIGHT * 3, 0);
         renderer = SDL_CreateRenderer(window, NULL);
         texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, SCREEN_WIDTH, SCREEN_HEIGHT);
         SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
+
+        // Establecer la resolución lógica y mantener el aspect ratio con bandas negras (Letterbox)
+        SDL_SetRenderLogicalPresentation(renderer, SCREEN_WIDTH, SCREEN_HEIGHT, 
+                                         SDL_LOGICAL_PRESENTATION_LETTERBOX);
+
+        // Inicializar con paleta DMG (Grises) por defecto
+        set_palette(0xFFecf2cb, 0xFF98d8b1, 0xFF4b849a, 0xFF1f285d);
+    }
+
+    // Método para cambiar la paleta de colores fácilmente
+    void set_palette(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3) {
+        colors[0] = c0; colors[1] = c1; colors[2] = c2; colors[3] = c3;
+    }
+
+    // Alternar entre pantalla completa y modo ventana
+    void toggle_fullscreen() {
+        Uint64 flags = SDL_GetWindowFlags(window);
+        SDL_SetWindowFullscreen(window, !(flags & SDL_WINDOW_FULLSCREEN));
     }
 
     ~PPU() {
@@ -111,18 +135,42 @@ public:
     }
 
     void render_scanline(const std::vector<uint8_t>& memory) {
-        if (!(lcdc & 0x01)) return; // Background enable bit
+        // Determinar si la Window está activa en esta línea
+        bool window_enabled = (lcdc & 0x20) && (ly >= wy) && (wx <= 166);
+        bool drew_window_pixel = false;
 
-        uint16_t tile_map_start = (lcdc & 0x08) ? 0x9C00 : 0x9800;
-        uint16_t tile_data_start = (lcdc & 0x10) ? 0x8000 : 0x8800;
-        bool unsigned_indices = (lcdc & 0x10);
+        auto get_color = [&](int color_id) {
+            int shade = (bgp >> (color_id * 2)) & 0x03;
+            return colors[shade];
+        };
 
+        uint32_t bg_color_0 = get_color(0);
+
+        // 1. RENDERIZAR FONDO Y WINDOW
+        if (lcdc & 0x01) { 
         uint8_t y_pos = ly + scy;
-        uint16_t tile_row = (y_pos / 8) * 32;
 
         for (int x = 0; x < SCREEN_WIDTH; x++) {
-            uint8_t x_pos = x + scx;
-            uint16_t tile_col = x_pos / 8;
+            uint16_t tile_map_start;
+            uint8_t current_x, current_y;
+
+            // Lógica de cambio entre Background y Window
+            if (window_enabled && x >= (wx - 7)) {
+                tile_map_start = (lcdc & 0x40) ? 0x9C00 : 0x9800;
+                current_x = x - (wx - 7);
+                current_y = window_line_counter;
+                drew_window_pixel = true;
+            } else {
+                tile_map_start = (lcdc & 0x08) ? 0x9C00 : 0x9800;
+                current_x = x + scx;
+                current_y = ly + scy;
+            }
+
+            uint16_t tile_data_start = (lcdc & 0x10) ? 0x8000 : 0x8800;
+            bool unsigned_indices = (lcdc & 0x10);
+
+            uint16_t tile_row = (current_y / 8) * 32;
+            uint16_t tile_col = current_x / 8;
             uint16_t tile_address = tile_map_start + tile_row + tile_col;
             
             int16_t tile_index;
@@ -133,16 +181,81 @@ public:
             if (unsigned_indices) tile_data_address = tile_data_start + (tile_index * 16);
             else tile_data_address = tile_data_start + ((tile_index + 128) * 16);
 
-            uint8_t line = (y_pos % 8) * 2;
+            uint8_t line = (current_y % 8) * 2;
             uint8_t byte1 = memory[tile_data_address + line];
             uint8_t byte2 = memory[tile_data_address + line + 1];
 
-            int color_bit = 7 - (x_pos % 8);
+            int color_bit = 7 - (current_x % 8);
             int color_id = ((byte1 >> color_bit) & 1) | (((byte2 >> color_bit) & 1) << 1);
 
-            // Paleta de grises
-            uint32_t colors[] = { 0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000 };
-            pixels[ly * SCREEN_WIDTH + x] = colors[color_id];
+            pixels[ly * SCREEN_WIDTH + x] = get_color(color_id);
+        }
+        }
+        else {
+            // Si el fondo está desactivado (DMG), la pantalla se llena con el color 0
+            for (int x = 0; x < SCREEN_WIDTH; x++) {
+                pixels[ly * SCREEN_WIDTH + x] = bg_color_0;
+            }
+        }
+
+        if (drew_window_pixel) window_line_counter++;
+
+        // 2. RENDERIZAR SPRITES (Objects)
+        if (lcdc & 0x02) {
+            bool use_8x16 = (lcdc & 0x04);
+
+            // Iterar en reversa: el sprite en el índice 0 tiene la mayor prioridad
+            // y debe dibujarse al final para quedar encima de los demás.
+            for (int i = 39; i >= 0; i--) {
+                uint16_t oam_addr = 0xFE00 + (i * 4);
+                int sprite_y = memory[oam_addr] - 16;
+                int sprite_x = memory[oam_addr + 1] - 8;
+                uint8_t tile_idx = memory[oam_addr + 2];
+                uint8_t attributes = memory[oam_addr + 3];
+
+                bool y_flip = attributes & 0x40;
+                bool x_flip = attributes & 0x20;
+                uint8_t palette = (attributes & 0x10) ? obp1 : obp0;
+
+                int height = use_8x16 ? 16 : 8;
+
+                // ¿Está el sprite en esta línea (ly)?
+                if (ly >= sprite_y && ly < (sprite_y + height)) {
+                    int line = ly - sprite_y;
+                    if (y_flip) line = height - 1 - line;
+
+                    // Para 8x16, el bit más bajo del índice se ignora
+                    if (use_8x16) tile_idx &= 0xFE;
+
+                    uint16_t tile_data_addr = 0x8000 + (tile_idx * 16) + (line * 2);
+                    uint8_t byte1 = memory[tile_data_addr];
+                    uint8_t byte2 = memory[tile_data_addr + 1];
+
+                    for (int tile_x = 0; tile_x < 8; tile_x++) {
+                        int pixel_x = sprite_x + tile_x;
+                        if (pixel_x < 0 || pixel_x >= SCREEN_WIDTH) continue;
+
+                        int color_bit = x_flip ? tile_x : (7 - tile_x);
+                        int color_id = ((byte1 >> color_bit) & 1) | (((byte2 >> color_bit) & 1) << 1);
+
+                        // Color 0 es transparente para sprites
+                        if (color_id == 0) continue;
+
+                        // Prioridad: Si el bit 7 de atributos es 1, el sprite se dibuja 
+                        // detrás del fondo (a menos que el fondo sea color 0)
+                        bool bg_over_obj = attributes & 0x80;
+                        // Nota: Si el fondo está desactivado (lcdc & 0x01 == 0), la prioridad se ignora.
+                        if (bg_over_obj && (lcdc & 0x01) && pixels[ly * SCREEN_WIDTH + pixel_x] != bg_color_0) {
+                            continue;
+                        }
+
+                        // Aplicar paleta del objeto
+                        int shade = (palette >> (color_id * 2)) & 0x03;
+                        pixels[ly * SCREEN_WIDTH + pixel_x] = colors[shade];
+                    }
+                }
+                // Límite de hardware: solo 10 sprites por línea (Omitido por simplicidad técnica aquí)
+            }
         }
     }
 
@@ -151,32 +264,437 @@ public:
         if (!(lcdc & 0x80)) {
             ly = 0;
             cycles_count = 456;
+            stat = (stat & ~0x03) | 0x00; 
             return;
         }
 
         cycles_count -= cycles;
 
-        // Cada 456 ciclos de la CPU pasamos a la siguiente línea
+        // 1. Actualización de Modos (Solo si estamos en líneas de dibujo)
+        if (ly < SCREEN_HEIGHT) {
+            PPUMode current_mode = static_cast<PPUMode>(stat & 0x03);
+            PPUMode new_mode;
+            int ticks = 456 - cycles_count;
+
+            if (ticks < 80)      new_mode = MODE_OAM;
+            else if (ticks < 252) new_mode = MODE_VRAM;
+            else                 new_mode = MODE_HBLANK;
+
+            if (new_mode != current_mode) {
+                stat = (stat & 0xFC) | static_cast<uint8_t>(new_mode);
+                // Solicitar interrupción STAT si el bit de selección de modo está activo
+                bool interrupt = false;
+                if (new_mode == MODE_HBLANK && (stat & 0x08)) interrupt = true;
+                if (new_mode == MODE_OAM    && (stat & 0x20)) interrupt = true;
+                if (interrupt) memory[REG_IF] |= 0x02;
+            }
+        } else {
+            // Asegurar que el modo sea 1 durante todo el VBlank
+            if ((stat & 0x03) != MODE_VBLANK) {
+                stat = (stat & 0xFC) | MODE_VBLANK;
+                if (stat & 0x10) memory[REG_IF] |= 0x02; // Interrupción STAT Modo 1
+            }
+        }
+
+        // 2. Cambio de scanline
         if (cycles_count <= 0) {
             if (ly < SCREEN_HEIGHT) render_scanline(memory);
             ly++;
             cycles_count = 456;
 
-            if (ly >= 144) {
-                stat = (stat & 0xFC) | 0x01; // Modo 1: VBlank
+            // Comparación LYC (0xFF45)
+            uint8_t lyc = memory[REG_LYC];
+            if (ly == lyc) {
+                stat |= 0x04; // Set coincidence flag (bit 2)
+                if (stat & 0x40) memory[REG_IF] |= 0x02; // Interrupción STAT por coincidencia
             } else {
-                stat = (stat & 0xFC) | 0x02; // Modo simple: OAM/Transfer
+                stat &= ~0x04;
             }
 
-            if (ly > 153) {
-                ly = 0;
-                // Actualizar pantalla al final del frame
+            if (ly == 144) {
+                memory[REG_IF] |= 0x01;      // Interrupción VBlank
+
+                // Actualizar pantalla al inicio del VBlank
                 SDL_UpdateTexture(texture, NULL, pixels, SCREEN_WIDTH * sizeof(uint32_t));
                 SDL_RenderClear(renderer);
                 SDL_RenderTexture(renderer, texture, NULL, NULL);
                 SDL_RenderPresent(renderer);
-                memory[0xFF0F] |= 0x01; // Interrupción VBlank
             }
+
+            if (ly > 153) {
+                ly = 0;
+                window_line_counter = 0;
+                // Al reiniciar LY a 0, también chequear coincidencia LYC
+                if (ly == lyc) {
+                    stat |= 0x04;
+                    if (stat & 0x40) memory[REG_IF] |= 0x02;
+                } else {
+                    stat &= ~0x04;
+                }
+            }
+        }
+    }
+};
+
+// ===================== CLASE APU (AUDIO PROCESSING UNIT) =====================
+class APU {
+private:
+    uint8_t regs[0x30]; // Registros 0xFF10 - 0xFF3F
+    float sample_rate = 44100.0f;
+    float cycles_per_sample = 4194304.0f / 44100.0f;
+    float cycle_accumulator = 0;
+
+    // Frame Sequencer (512Hz) para Envelopes y Lengths
+    float sequencer_accumulator = 0;
+    int sequencer_step = 0;
+
+    // Estado interno de los canales
+    bool ch1_enabled = false, ch2_enabled = false, ch3_enabled = false, ch4_enabled = false;
+    int ch1_length = 0, ch2_length = 0, ch3_length = 0, ch4_length = 0;
+    bool ch1_len_enabled = false, ch2_len_enabled = false, ch3_len_enabled = false, ch4_len_enabled = false;
+
+    int ch1_env_vol = 0, ch2_env_vol = 0, ch4_env_vol = 0;
+    int ch1_env_ticks = 0, ch2_env_ticks = 0, ch4_env_ticks = 0;
+
+    // Estado del Sweep (Canal 1)
+    int ch1_sweep_timer = 0;
+    uint16_t ch1_shadow_freq = 0;
+    bool ch1_sweep_enabled = false;
+
+    float ch1_phase = 0;
+    float ch2_phase = 0;
+    float ch3_phase = 0;
+    float ch4_phase = 0;
+    uint16_t ch4_lfsr = 0x7FFF; // Registro de desplazamiento para ruido
+
+    // Estado del Filtro de Paso Alto (HPF) para eliminar DC Offset
+    float prev_sample_l = 0, prev_sample_r = 0;
+    float prev_out_l = 0, prev_out_r = 0;
+
+    // Estado del Filtro de Paso Bajo (LPF) para un sonido más suave (Filtro Linear)
+    float lpf_l = 0, lpf_r = 0;
+
+    float audio_buffer[256];
+    int buffer_ptr = 0;
+
+public:
+    SDL_AudioStream* stream = nullptr;
+
+    APU() {
+        SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, 44100 };
+        stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+        if (stream) {
+            SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(stream));
+        }
+        std::memset(regs, 0, sizeof(regs));
+    }
+
+    ~APU() {
+        if (stream) SDL_DestroyAudioStream(stream);
+    }
+
+    void write(uint16_t addr, uint8_t val) {
+        if (addr == 0xFF26) {
+            uint8_t old_power = regs[0x16] & 0x80;
+            uint8_t new_power = val & 0x80;
+            if (!(val & 0x80)) {
+                // Apagar todos los canales y limpiar registros
+                std::memset(regs, 0, 0x16); // 0xFF10 - 0xFF25
+                ch1_enabled = ch2_enabled = ch3_enabled = ch4_enabled = false;
+                ch1_phase = ch2_phase = ch3_phase = ch4_phase = 0;
+                prev_sample_l = prev_sample_r = prev_out_l = prev_out_r = 0;
+                lpf_l = lpf_r = 0;
+            }
+            regs[0x16] = new_power; 
+            return;
+        }
+
+        // Si el sonido maestro está apagado, ignorar escrituras a otros registros
+        if (!(regs[0x16] & 0x80)) return;
+
+        uint8_t reg_idx = addr - 0xFF10;
+        if (reg_idx < 0x30) regs[reg_idx] = val;
+
+        // Lógica de Length Counters y Triggers
+        switch(addr) {
+            case 0xFF1A: { // NR30 DAC Power
+                bool dac_on = val & 0x80;
+                if (!dac_on) ch3_enabled = false;
+                regs[0x0A] = val; 
+                break;
+            }
+            case 0xFF11: ch1_length = 64 - (val & 0x3F); break;
+            case 0xFF14: 
+                ch1_len_enabled = val & 0x40;
+                if (val & 0x80) trigger_ch1();
+                break;
+            case 0xFF16: ch2_length = 64 - (val & 0x3F); break;
+            case 0xFF19: 
+                ch2_len_enabled = val & 0x40;
+                if (val & 0x80) trigger_ch2(); 
+                break;
+            case 0xFF1B: ch3_length = 256 - val; break;
+            case 0xFF1E: 
+                ch3_len_enabled = val & 0x40;
+                if ((val & 0x80) && (regs[0x1A - 0xFF10] & 0x80)) { 
+                    ch3_enabled = true; 
+                    ch3_phase = 0; // Reiniciar la onda para que la nota empiece limpia
+                    if(ch3_length == 0) ch3_length = 256; 
+                }
+                break;
+            case 0xFF20: ch4_length = 64 - (val & 0x3F); break;
+            case 0xFF23: 
+                ch4_len_enabled = val & 0x40;
+                if (val & 0x80) trigger_ch4(); 
+                break;
+        }
+    }
+
+    void trigger_ch1() {
+        // El canal solo se activa si el DAC tiene energía
+        if ((regs[0x02] & 0xF8) != 0) {
+            ch1_enabled = true;
+            ch1_phase = 0;
+            ch1_env_vol = regs[0x02] >> 4;
+            ch1_env_ticks = regs[0x02] & 0x07;
+            if (ch1_length == 0) ch1_length = 64;
+        }
+
+        // Inicializar Sweep
+        ch1_shadow_freq = regs[0x03] | ((regs[0x04] & 0x07) << 8);
+        uint8_t nr10 = regs[0x00];
+        int sweep_period = (nr10 >> 4) & 0x07;
+        int sweep_shift = nr10 & 0x07;
+        ch1_sweep_timer = (sweep_period == 0) ? 8 : sweep_period;
+        ch1_sweep_enabled = (sweep_period != 0) || (sweep_shift != 0);
+    }
+
+    void update_sweep() {
+        if (ch1_sweep_timer > 0) ch1_sweep_timer--;
+
+        if (ch1_sweep_timer == 0) {
+            uint8_t nr10 = regs[0x00];
+            int sweep_period = (nr10 >> 4) & 0x07;
+            ch1_sweep_timer = (sweep_period == 0) ? 8 : sweep_period;
+
+            if (ch1_sweep_enabled && sweep_period > 0) {
+                int sweep_shift = nr10 & 0x07;
+                bool negate = nr10 & 0x08;
+                uint16_t delta = ch1_shadow_freq >> sweep_shift;
+                uint16_t new_freq = negate ? (ch1_shadow_freq - delta) : (ch1_shadow_freq + delta);
+
+                if (new_freq > 2047) {
+                    ch1_enabled = false;
+                } else if (sweep_shift > 0) {
+                    ch1_shadow_freq = new_freq;
+                    regs[0x03] = new_freq & 0xFF;
+                    regs[0x04] = (regs[0x04] & 0xF8) | ((new_freq >> 8) & 0x07);
+                }
+            }
+        }
+    }
+
+    void trigger_ch2() {
+        if ((regs[0x07] & 0xF8) != 0) {
+            ch2_enabled = true;
+            ch2_env_vol = regs[0x07] >> 4;
+            ch2_env_ticks = regs[0x07] & 0x07;
+            if (ch2_length == 0) ch2_length = 64;
+        }
+    }
+
+    void trigger_ch4() {
+        if ((regs[0x11] & 0xF8) != 0) {
+            ch4_enabled = true;
+            ch4_env_vol = regs[0x11] >> 4;
+            ch4_env_ticks = regs[0x11] & 0x07;
+            if (ch4_length == 0) ch4_length = 64;
+        }
+    }
+
+    uint8_t read(uint16_t addr) {
+        if (addr == 0xFF26) { // NR52: Retornar el estado real de los canales
+            uint8_t power = regs[0x16] & 0x80;
+            if (!power) return 0x70; // Si no hay energía, los estados son 0
+            // Se añade cast a uint8_t para evitar el warning C4805
+            return power | (ch4_enabled << 3) | (ch3_enabled << 2) | (ch2_enabled << 1) | (uint8_t)ch1_enabled | 0x70; 
+        }
+        if (addr >= 0xFF30 && addr <= 0xFF3F) {
+            return regs[addr - 0xFF10]; // Wave RAM
+        }
+        return regs[addr - 0xFF10] | 0xFF;
+    }
+
+    void tick(int cycles) {
+        cycle_accumulator += cycles;
+        sequencer_accumulator += cycles;
+
+        // El Frame Sequencer corre a 512Hz
+        if (sequencer_accumulator >= 8192) { // 4MHz / 512 = 8192
+            sequencer_accumulator -= 8192;
+            step_sequencer();
+        }
+
+        while (cycle_accumulator >= cycles_per_sample) {
+            generate_sample();
+            cycle_accumulator -= cycles_per_sample;
+        }
+    }
+
+    void step_sequencer() {
+        sequencer_step = (sequencer_step + 1) % 8;
+        
+        // Contadores de Longitud (256Hz) - Se ejecutan en pasos pares
+        if (sequencer_step % 2 == 0) {
+            if (ch1_len_enabled && ch1_length > 0) { if (--ch1_length == 0) ch1_enabled = false; }
+            if (ch2_len_enabled && ch2_length > 0) { if (--ch2_length == 0) ch2_enabled = false; }
+            if (ch3_len_enabled && ch3_length > 0) { if (--ch3_length == 0) ch3_enabled = false; }
+            if (ch4_len_enabled && ch4_length > 0) { if (--ch4_length == 0) ch4_enabled = false; }
+        }
+
+        // Sweep (128Hz) - Pasos 2 y 6
+        if (sequencer_step == 2 || sequencer_step == 6) {
+            update_sweep();
+        }
+
+        // Cada 64Hz (paso 7) actualizamos los Envelopes
+        if (sequencer_step == 7) {
+            auto update_env = [](uint8_t reg, int& vol, int& ticks) {
+                int sweep_pace = reg & 0x07;
+                if (sweep_pace == 0) return;
+                if (ticks > 0) {
+                    ticks--;
+                    if (ticks == 0) {
+                        ticks = sweep_pace;
+                        bool inc = reg & 0x08;
+                        if (inc && vol < 15) vol++;
+                        else if (!inc && vol > 0) vol--;
+                    }
+                }
+            };
+            update_env(regs[0x02], ch1_env_vol, ch1_env_ticks);
+            update_env(regs[0x07], ch2_env_vol, ch2_env_ticks);
+            update_env(regs[0x11], ch4_env_vol, ch4_env_ticks);
+        }
+    }
+
+    void generate_sample() {
+        if (!stream) return;
+
+        float left = 0.0f, right = 0.0f;
+        const float duty_lookup[] = { 0.125f, 0.25f, 0.50f, 0.75f };
+
+        // NR50 (0xFF24) Control de volumen maestro
+        float master_vol_l = ((regs[0x14] >> 4) & 0x07) / 7.0f;
+        float master_vol_r = (regs[0x14] & 0x07) / 7.0f;
+
+        // NR51 (0xFF25) Panning
+        uint8_t panning = regs[0x15];
+
+        // NR52 (0xFF26) Bit 7 es el interruptor maestro de sonido
+        if (regs[0x16] & 0x80) {
+            // Canal 1
+            uint16_t freq1 = regs[0x03] | ((regs[0x04] & 0x07) << 8);
+            if (ch1_enabled && freq1 > 0) {
+                float f = 131072.0f / (2048.0f - freq1);
+                ch1_phase += f / sample_rate;
+                if (ch1_phase > 1.0f) ch1_phase -= 1.0f;
+                float duty = duty_lookup[regs[0x01] >> 6];
+                float val = (ch1_phase < duty ? 1.0f : -1.0f) * (ch1_env_vol / 15.0f) * 0.1f;
+                if (panning & 0x10) left += val;
+                if (panning & 0x01) right += val;
+            }
+            // Canal 2
+            uint16_t freq2 = regs[0x08] | ((regs[0x09] & 0x07) << 8);
+            if (ch2_enabled && freq2 > 0) {
+                float f = 131072.0f / (2048.0f - freq2);
+                ch2_phase += f / sample_rate;
+                if (ch2_phase > 1.0f) ch2_phase -= 1.0f;
+                float duty = duty_lookup[regs[0x06] >> 6];
+                float val = (ch2_phase < duty ? 1.0f : -1.0f) * (ch2_env_vol / 15.0f) * 0.1f;
+                if (panning & 0x20) left += val;
+                if (panning & 0x02) right += val;
+            }
+            // Canal 3 (Bajo / Wave RAM) - Corrección de DC Offset
+            uint8_t nr30 = regs[0x0A]; // NR30 (0xFF1A)
+            if (ch3_enabled && (nr30 & 0x80)) {
+                uint16_t freq3 = regs[0x0D] | ((regs[0x0E] & 0x07) << 8); // 0xFF1D y 0xFF1E
+                if (freq3 < 2048) {
+                    float f = 2097152.0f / (2048.0f - freq3);
+                    ch3_phase += (f / 32.0f) / sample_rate;
+                    if (ch3_phase > 1.0f) ch3_phase -= 1.0f;
+                    
+                    int sample_idx = (int)(ch3_phase * 32.0f) & 31;
+
+                    uint8_t wave_byte = regs[(0xFF30 + (sample_idx / 2)) - 0xFF10];
+                    uint8_t wave_sample = (sample_idx % 2 == 0) ? (wave_byte >> 4) : (wave_byte & 0x0F);
+                    
+                    // 1. Centrar la muestra (0..15) a (-1.0..1.0) PRIMERO
+                    float centered_sample = ((float)wave_sample - 7.5f) / 7.5f;
+
+                    // 2. Aplicar el volumen (shift) de forma multiplicativa
+                    int shift = (regs[0x0C] >> 5) & 0x03; // NR32 (0xFF1C)
+                    float volume = 0.0f;
+                    if (shift == 1)      volume = 1.0f;  // 100%
+                    else if (shift == 2) volume = 0.5f;  // 50%
+                    else if (shift == 3) volume = 0.25f; // 25%
+                    
+                    if (volume > 0) {
+                        float val = (centered_sample * volume) * 0.10f;
+                        if (panning & 0x40) left += val;
+                        if (panning & 0x04) right += val;
+                    }
+                }
+            }
+            // Canal 4
+            uint8_t nr43 = regs[0xFF22 - 0xFF10];
+            float s = (nr43 >> 4) & 0x0F;
+            float r = (nr43 & 0x07);
+            if (r == 0) r = 0.5f;
+            float f_noise = 524288.0f / r / (float)(1 << (int)(s + 1));
+
+            ch4_phase += f_noise / sample_rate;
+            while (ch4_phase > 1.0f) {
+                ch4_phase -= 1.0f;
+                // Lógica de LFSR para generar ruido blanco
+                uint16_t result = (ch4_lfsr & 1) ^ ((ch4_lfsr >> 1) & 1);
+                ch4_lfsr = (ch4_lfsr >> 1) | (result << 14);
+                if (nr43 & 0x08) { // Modo de paso corto (7 bits)
+                    ch4_lfsr = (ch4_lfsr & ~0x40) | (result << 6);
+                }
+            }
+            if (ch4_enabled && ch4_env_vol > 0) {
+                float val = ((ch4_lfsr & 1) ? 1.0f : -1.0f) * (ch4_env_vol / 15.0f) * 0.05f;
+                if (panning & 0x80) left += val;
+                if (panning & 0x08) right += val;
+            }
+        }
+
+        float mixed_l = left * master_vol_l;
+        float mixed_r = right * master_vol_r;
+
+        // Aplicar Filtro de Paso Alto (capacitor de salida)
+        // Esto centra la onda en el cero dinámicamente, eliminando el zumbido de DC.
+        prev_out_l = mixed_l - prev_sample_l + 0.996f * prev_out_l;
+        prev_out_r = mixed_r - prev_sample_r + 0.996f * prev_out_r;
+        prev_sample_l = mixed_l;
+        prev_sample_r = mixed_r;
+
+        // Aplicar Filtro de Paso Bajo (LPF) - Suavizado linear
+        // Esto elimina los armónicos más agudos y estridentes, dando un tono más analógico.
+        lpf_l += (prev_out_l - lpf_l) * 0.6f;
+        lpf_r += (prev_out_r - lpf_r) * 0.6f;
+
+        audio_buffer[buffer_ptr++] = lpf_l;
+        audio_buffer[buffer_ptr++] = lpf_r;
+        if (buffer_ptr >= 256) {
+            // Sincronización: si la cola de SDL tiene más de ~20ms de audio, esperamos
+            // 44100 muestras/seg * 2 canales * 4 bytes/muestra * 0.020 seg = ~7056 bytes
+            while (SDL_GetAudioStreamQueued(stream) > 7056) {
+                SDL_Delay(1);
+            }
+            SDL_PutAudioStreamData(stream, audio_buffer, buffer_ptr * sizeof(float));
+            buffer_ptr = 0;
         }
     }
 };
@@ -226,55 +744,99 @@ private:
     std::vector<uint8_t> rom;
     uint8_t current_bank; // Para soporte básico de MBC1
     
+    // Estado del Joypad (Bits 0-3, 0 = presionado)
+    uint8_t joypad_buttons;    // A, B, Select, Start
+    uint8_t joypad_directions; // Right, Left, Up, Down
+
     // Componentes
     CPU cpu;
     PPU ppu;
+    APU apu;
     Timer timer;
-    
-    // Para debug
-    std::vector<uint8_t> unsupported_opcodes;
 
-    // Verifica y muestra los caracteres enviados por el test de Blargg
-    void depurar_puerto_serial() {
-        // 0xFF02 es el registro SC (Serial Control)
-        // Bit 7 = transferencia en progreso, Bit 1 = velocidad
-        if ((memory[0xFF02] & 0x80) != 0) { 
-            // 0xFF01 es el registro SB (Serial Data)
-            char c = static_cast<char>(memory[0xFF01]); 
-            
-            if (c == '\n') {
-                std::cout << std::endl;
-            } else if (c >= 32 && c < 127) {
-                std::cout << c;
+    // Sincronización de ciclos
+    int frame_cycles = 0;
+
+    // Actualiza los componentes del sistema y rastrea los ciclos del frame
+    void tick(int cycles) {
+        ppu.update(cycles, memory);
+        timer.update(cycles, memory);
+        apu.tick(cycles);
+        frame_cycles += cycles;
+    }
+    
+    // Maneja la entrada de teclado mapeando a los botones de GB
+    void manejar_teclado(SDL_Keycode key, bool pressed) {
+        uint8_t bit = 0xFF;
+        bool is_direction = false;
+        switch (key) {
+            case SDLK_RIGHT:  bit = 0; is_direction = true; break;
+            case SDLK_LEFT:   bit = 1; is_direction = true; break;
+            case SDLK_UP:     bit = 2; is_direction = true; break;
+            case SDLK_DOWN:   bit = 3; is_direction = true; break;
+            case SDLK_Z:      bit = 0; is_direction = false; break; // Botón A
+            case SDLK_X:      bit = 1; is_direction = false; break; // Botón B
+            case SDLK_SPACE:  bit = 2; is_direction = false; break; // Select
+            case SDLK_RETURN: bit = 3; is_direction = false; break; // Start
+        }
+
+        if (bit != 0xFF) {
+            if (is_direction) {
+                if (pressed) joypad_directions &= ~(1 << bit);
+                else joypad_directions |= (1 << bit);
             } else {
-                // Otros caracteres de control se muestran en hex pero de forma más limpia
-                std::cerr << "[SERIAL: 0x" << std::hex << (int)(uint8_t)c << std::dec << "]";
+                if (pressed) joypad_buttons &= ~(1 << bit);
+                else joypad_buttons |= (1 << bit);
             }
-            std::cout << std::flush;
-            
-            memory[0xFF02] &= 0x7F; // Limpia el bit de transferencia
+            // Tetris no usa interrupción de Joypad, prefiere polling.
         }
     }
 
+    // Para debug
+    std::vector<uint8_t> unsupported_opcodes;
+
     // Lee un valor de 8 bits de memoria
     uint8_t readMem(uint16_t addr) {
-        // Redirección de registros de Timer
-        if (addr == 0xFF04) return (timer.div_counter >> 8) & 0xFF;
-        if (addr == 0xFF05) return timer.tima;
-        if (addr == 0xFF06) return timer.tma;
-        if (addr == 0xFF07) return timer.tac;
+        // Redirección de registros de la APU (0xFF10 - 0xFF3F)
+        if (addr >= 0xFF10 && addr <= 0xFF3F) return apu.read(addr);
 
-        if (addr == 0xFF41) return ppu.stat;
-        // Redirección de registros de la PPU
-        if (addr == 0xFF40) return ppu.lcdc;
-        if (addr == 0xFF42) return ppu.scy;
-        if (addr == 0xFF43) return ppu.scx;
-        if (addr == 0xFF44) return ppu.ly; // El test suele leer esto
+        // 1. Manejo de Registros de Entrada/Salida (I/O)
+        if (addr >= 0xFF00 && addr <= 0xFF7F) {
+            switch (addr) {
+                case REG_JOYP: {
+                    uint8_t select = memory[REG_JOYP] & 0x30; 
+            uint8_t res = 0x0F;
+            if (!(select & 0x10)) res &= joypad_directions; // P14 seleccionado
+            if (!(select & 0x20)) res &= joypad_buttons;    // P15 seleccionado
+            return 0xC0 | select | res;
+        }
+                // DIV incrementa cada 256 T-states (16384Hz)
+                case REG_DIV:  return (timer.div_counter >> 8) & 0xFF;
+                case REG_TIMA: return timer.tima;
+                case REG_TMA:  return timer.tma;
+                case REG_TAC:  return timer.tac;
+                case REG_IF:   return memory[REG_IF] | 0xE0; // Bits 5-7 son siempre 1
+                case REG_LCDC: return ppu.lcdc;
+                case REG_STAT: return ppu.stat;
+                case REG_SCY:  return ppu.scy;
+                case REG_SCX:  return ppu.scx;
+                case REG_LY:   return ppu.ly;
+                case REG_LYC:  return memory[REG_LYC];
+                case REG_BGP:  return ppu.bgp;
+                case REG_OBP0: return ppu.obp0;
+                case REG_OBP1: return ppu.obp1;
+                case REG_WY:   return ppu.wy;
+                case REG_WX:   return ppu.wx;
+                default:       return memory[addr];
+            }
+        }
 
-        // Mapeo de memoria con MBC1 básico
-        if (addr <= 0x3FFF) return rom[addr]; // Banco 0 fijo
+        // 2. Registro de Habilitación de Interrupciones
+        if (addr == REG_IE) return memory[REG_IE]; // No enmascarar IE para tests de Blargg
+
+        // 3. Mapeo de Memoria (ROM / RAM)
+        if (addr <= 0x3FFF) return rom[addr];
         if (addr >= 0x4000 && addr <= 0x7FFF) {
-            // Banco 1 seleccionable
             uint32_t offset = (addr - 0x4000) + (current_bank * 0x4000);
             return rom[offset % rom.size()];
         }
@@ -287,18 +849,59 @@ private:
 
     // Escribe un valor de 8 bits a memoria
     void writeMem(uint16_t addr, uint8_t value) {
-        // Redirección de registros de Timer
-        if (addr == 0xFF04) { timer.div_counter = 0; return; }
-        if (addr == 0xFF05) { timer.tima = value; return; }
-        if (addr == 0xFF06) { timer.tma = value; return; }
-        if (addr == 0xFF07) { timer.tac = value; return; }
+        // Redirección de registros de la APU (0xFF10 - 0xFF3F)
+        if (addr >= 0xFF10 && addr <= 0xFF3F) { apu.write(addr, value); return; }
 
-        if (addr == 0xFF41) { ppu.stat = value; return; }
-        // Redirección de registros de la PPU
-        if (addr == 0xFF40) { ppu.lcdc = value; return; }
-        if (addr == 0xFF42) { ppu.scy = value; return; }
-        if (addr == 0xFF43) { ppu.scx = value; return; }
-        if (addr == 0xFF44) { return; } // LY es de solo lectura para la CPU
+        // 1. Manejo de Registros I/O
+        if (addr >= 0xFF00 && addr <= 0xFF7F) {
+            switch (addr) {
+                case REG_JOYP: memory[REG_JOYP] = (value & 0x30); break;
+                case REG_SB:   memory[REG_SB] = value; break;
+                case REG_SC: {
+                    // Restaurar salida de depuración para ver resultados de Blargg
+                    if (value == 0x81) {
+                        std::cout << (char)memory[REG_SB] << std::flush;
+                    }
+
+                    memory[REG_SC] = value;
+                    if ((value & 0x81) == 0x81) {
+                        memory[REG_SB] = 0xFF;
+                        memory[REG_SC] &= 0x7F;
+                        memory[REG_IF] |= 0x08;
+                    }
+                    break;
+                }
+                case REG_DIV:  timer.div_counter = 0; timer.tima_counter = 0; break; // Escribir en DIV resetea el contador
+                case REG_TIMA: timer.tima = value; break;
+                case REG_TMA:  timer.tma = value; break;
+                case REG_TAC:  timer.tac = value; break;
+                case REG_IF:   memory[REG_IF] = value; break;
+                case REG_LCDC: ppu.lcdc = value; break;
+                case REG_STAT: ppu.stat = (value & 0xF8) | (ppu.stat & 0x07); break;
+                case REG_SCY:  ppu.scy = value; break;
+                case REG_SCX:  ppu.scx = value; break;
+                case REG_LY:   break; // Read-only
+                case REG_LYC:  memory[REG_LYC] = value; break;
+                case REG_BGP:  ppu.bgp = value; break;
+                case REG_OBP0: ppu.obp0 = value; break;
+                case REG_OBP1: ppu.obp1 = value; break;
+                case REG_WY:   ppu.wy = value; break;
+                case REG_WX:   ppu.wx = value; break;
+                case REG_DMA: {
+            uint16_t source = value << 8;
+            for (int i = 0; i < 0xA0; i++) {
+                uint8_t data = readMem(source + i);
+                memory[0xFE00 + i] = data; 
+            }
+                    break;
+                }
+                default: memory[addr] = value; break;
+            }
+            return;
+        }
+
+        // 2. Registro de Habilitación de Interrupciones
+        if (addr == REG_IE) { memory[REG_IE] = value; return; }
 
         // Escritura en área de control MBC1
         if (addr >= 0x2000 && addr <= 0x3FFF) {
@@ -315,8 +918,8 @@ private:
 
     // Gestiona las interrupciones pendientes
     void manejar_interrupciones() {
-        uint8_t ie = readMem(0xFFFF);
-        uint8_t if_reg = readMem(0xFF0F);
+        uint8_t ie = readMem(REG_IE);
+        uint8_t if_reg = readMem(REG_IF);
         uint8_t pending = ie & if_reg;
 
         if (pending != 0) {
@@ -325,6 +928,8 @@ private:
                 for (int i = 0; i < 5; i++) {
                     if (pending & (1 << i)) {
                         servir_interrupcion(i);
+                        // El servicio de interrupción consume ciclos
+                        tick(20);
                         break;
                     }
                 }
@@ -335,15 +940,14 @@ private:
     // Salta al vector de interrupción correspondiente
     void servir_interrupcion(int bit) {
         cpu.ime = false;
-        uint8_t if_reg = readMem(0xFF0F);
-        writeMem(0xFF0F, if_reg & ~(1 << bit)); // Limpiar el flag en IF
+        uint8_t if_reg = readMem(REG_IF);
+        writeMem(REG_IF, if_reg & ~(1 << bit)); // Limpiar el flag en IF
         
         cpu.SP -= 2;
         writeMem16(cpu.SP, cpu.PC);
         
         uint16_t targets[] = {0x40, 0x48, 0x50, 0x58, 0x60};
         cpu.PC = targets[bit];
-        cpu.cycles += 20; // Servir interrupción tarda 20 ciclos
     }
 
     // Lee un valor de 16 bits de memoria
@@ -371,6 +975,7 @@ private:
         
         // Decodificación de instrucciones Z80
         switch (opcode) {
+            // === INSTRUCCIONES DE CONTROL ===
             // NOP
             case 0x00:
                 cpu.cycles = 4;
@@ -382,6 +987,7 @@ private:
                 cpu.cycles = 4;
                 break;
 
+            // === ROTACIONES Y BITS ===
             // RRCA
             case 0x0F: {
                 uint8_t carry = cpu.A & 1;
@@ -418,6 +1024,7 @@ private:
                 break;
             }
 
+            // === SALTOS RELATIVOS ===
             // JR n (Jump Relative)
             case 0x18: cpu.PC += (int8_t)readMem(cpu.PC + 1) + 2; increment = 0; cpu.cycles = 12; break;
             
@@ -439,6 +1046,7 @@ private:
                 else { increment = 2; cpu.cycles = 8; }
                 break;
 
+            // === CARGAS DE 16 BITS ===
             // LD (HL-), A
             case 0x32:
                 writeMem(cpu.getHL(), cpu.A);
@@ -462,6 +1070,7 @@ private:
             case 0x23: cpu.setHL(cpu.getHL() + 1); cpu.cycles = 8; break;
             case 0x33: cpu.SP++; cpu.cycles = 8; break;
 
+            // === ARITMÉTICA DE 8 BITS ===
             // INC r
             case 0x04: case 0x0C: case 0x14: case 0x1C: case 0x24: case 0x2C: case 0x3C: {
                 uint8_t* reg;
@@ -502,6 +1111,7 @@ private:
                 break;
             }
 
+            // === CARGAS DE 8 BITS ===
             // LD r, u8
             case 0x06: cpu.B = readMem(cpu.PC + 1); increment = 2; cpu.cycles = 8; break;
             case 0x0E: cpu.C = readMem(cpu.PC + 1); increment = 2; cpu.cycles = 8; break;
@@ -641,7 +1251,7 @@ private:
             case 0x77: writeMem(cpu.getHL(), cpu.A); cpu.cycles = 8; break;
             case 0x7E: cpu.A = readMem(cpu.getHL()); cpu.cycles = 8; break;
 
-            // Operaciones Aritméticas con (HL)
+            // === OPERACIONES LÓGICO-ARITMÉTICAS ===
             case 0x86: { // ADD A, (HL)
                 uint8_t val = readMem(cpu.getHL());
                 uint16_t result = cpu.A + val;
@@ -874,6 +1484,7 @@ private:
                 break;
             }
 
+            // === PILA (STACK) ===
             // PUSH rr
             case 0xC5: cpu.SP -= 2; writeMem16(cpu.SP, cpu.getBC()); cpu.cycles = 16; break;
             case 0xD5: cpu.SP -= 2; writeMem16(cpu.SP, cpu.getDE()); cpu.cycles = 16; break;
@@ -886,6 +1497,7 @@ private:
             case 0xE1: cpu.setHL(readMem16(cpu.SP)); cpu.SP += 2; cpu.cycles = 12; break;
             case 0xF1: cpu.setAF(readMem16(cpu.SP)); cpu.SP += 2; cpu.cycles = 12; break;
 
+            // === SALTOS ABSOLUTOS ===
             // JP u16 (salto incondicional)
             case 0xC3: {
                 uint16_t addr = readMem16(cpu.PC + 1);
@@ -983,7 +1595,7 @@ private:
                 break;
             }
 
-            // RETI (Return from Interrupt)
+            // === RETORNOS ===
             case 0xD9:
                 cpu.PC = readMem16(cpu.SP);
                 cpu.SP += 2;
@@ -1026,6 +1638,7 @@ private:
                 cpu.cycles = 4;
                 break;
 
+            // === AJUSTES ESPECIALES ===
             // DAA (Decimal Adjust Accumulator)
             case 0x27: {
                 uint8_t reg = cpu.A;
@@ -1128,6 +1741,7 @@ private:
                 break;
             }
 
+            // === LÓGICA DE BITS ===
             // AND u8
             case 0xE6: {
                 uint8_t val = readMem(cpu.PC + 1);
@@ -1167,8 +1781,9 @@ private:
                 break;
             }
 
+            // === IO Y LDH ===
             // LD (C), A / LD A, (C) / ADD SP, n / LD HL, SP+n
-            case 0xE2: writeMem(0xFF00 + cpu.C, cpu.A); cpu.cycles = 8; break;
+            case 0xE2: writeMem(0xFF00 + cpu.C, cpu.A); cpu.cycles = 8; break; 
             case 0xF2: cpu.A = readMem(0xFF00 + cpu.C); cpu.cycles = 8; break;
             case 0xE8: {
                 int8_t offset = (int8_t)readMem(cpu.PC + 1);
@@ -1232,6 +1847,7 @@ private:
                 break;
             }
 
+            // === PREFIJO CB (INSTRUCCIONES DE BITS) ===
             // Instrucciones Prefixed 0xCB
             case 0xCB: {
                 uint8_t cb_opcode = readMem(cpu.PC + 1);
@@ -1341,127 +1957,64 @@ private:
     }
 
 public:
-    GameBoy() : memory(0x10000, 0x00), rom(0x10000, 0x00), current_bank(1), cpu(), ppu(), timer() {}
+    GameBoy() : memory(0x10000, 0), current_bank(1), joypad_buttons(0x0F), joypad_directions(0x0F) {}
 
-    // Carga el ROM en la memoria del sistema
     bool cargar_rom(const std::string& ruta_archivo) {
         std::ifstream archivo(ruta_archivo, std::ios::binary | std::ios::ate);
-        
-        if (!archivo.is_open()) {
-            std::cerr << "Error: No se pudo abrir el ROM: " << ruta_archivo << "\n";
-            return false;
-        }
-
+        if (!archivo.is_open()) return false;
         std::streamsize tamano = archivo.tellg();
         archivo.seekg(0, std::ios::beg);
-
-        // Evita desbordar los 64KB si el archivo es más grande de lo esperado
-        if (tamano > 0x10000) {
-            tamano = 0x10000;
-        }
-
-        if (!archivo.read(reinterpret_cast<char*>(rom.data()), tamano)) {
-            std::cerr << "Error al leer los datos del ROM.\n";
-            return false;
-        }
-
-        return true;
+        rom.resize(static_cast<size_t>(tamano));
+        return (bool)archivo.read(reinterpret_cast<char*>(rom.data()), tamano);
     }
 
-    // Muestra una representación visual simplificada de los Tiles en consola
-    void visualizar_vram() {
-        std::cout << "\n--- Visualización de Tiles (VRAM) ---\n";
-        // Los tiles están en 0x8000-0x8FFF. Mostramos los primeros 8 tiles.
-        for (int t = 0; t < 8; t++) {
-            std::cout << "Tile " << t << ":\n";
-            for (int y = 0; y < 8; y++) {
-                uint16_t addr = 0x8000 + (t * 16) + (y * 2);
-                uint8_t byte1 = memory[addr];
-                uint8_t byte2 = memory[addr + 1];
-                for (int x = 7; x >= 0; x--) {
-                    int color = ((byte1 >> x) & 1) | (((byte2 >> x) & 1) << 1);
-                    if (color == 0) std::cout << "  ";
-                    else if (color == 1) std::cout << ". ";
-                    else if (color == 2) std::cout << "x ";
-                    else std::cout << "# ";
-                }
-                std::cout << "\n";
-            }
-        }
-    }
-
-    // Bucle principal de ejecución del emulador
-    void ejecutar(bool debug = false) {
-        std::cout << "Iniciando emulación del Game Boy...\n";
-        std::cout << "Estado inicial de la CPU:\n";
-        cpu.printState();
-        std::cout << "\n";
-        
+    void ejecutar() {
         bool corriendo = true;
-        long long instrucciones_ejecutadas = 0;
+        uint64_t instrucciones = 0;
+        const double ms_per_frame = 1000.0 / 59.73;
+        uint64_t frame_start_time = SDL_GetTicks();
+        const int CYCLES_PER_FRAME = 70224; // 154 líneas * 456 ciclos
+        frame_cycles = 0;
 
         while (corriendo) {
-            // Manejo de eventos de SDL
-            if (instrucciones_ejecutadas % 1000 == 0) {
+            if (instrucciones % 100 == 0) {
                 SDL_Event event;
                 while (SDL_PollEvent(&event)) {
                     if (event.type == SDL_EVENT_QUIT) corriendo = false;
+                    else if (event.type == SDL_EVENT_KEY_DOWN) {
+                        if (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT)) {
+                            ppu.toggle_fullscreen();
+                        } else {
+                            manejar_teclado(event.key.key, true);
+                        }
+                    }
+                    else if (event.type == SDL_EVENT_KEY_UP) manejar_teclado(event.key.key, false);
                 }
             }
 
             ejecutar_instruccion();
-            ppu.update(cpu.cycles, memory); // Sincronizamos la PPU con los ciclos usados
-            timer.update(cpu.cycles, memory); // Sincronizamos el Timer
-            manejar_interrupciones(); // Revisar IF/IE después de cada instrucción
-            depurar_puerto_serial();
+            tick(cpu.cycles);
+            manejar_interrupciones();
 
-            instrucciones_ejecutadas++;
-
-            // Limites de salida
-            if (cpu.halted) {
-              //  visualizar_vram(); // Al detenerse, mostramos qué hay en memoria de video
+            if (frame_cycles >= CYCLES_PER_FRAME) {
+                frame_cycles -= CYCLES_PER_FRAME;
+                uint64_t now = SDL_GetTicks();
+                uint64_t elapsed = now - frame_start_time;
+                if (elapsed < ms_per_frame) SDL_Delay((uint32_t)(ms_per_frame - elapsed));
+                frame_start_time = SDL_GetTicks();
             }
-
-            if (cpu.PC >= 0xFFFF) {
-                std::cout << "\nPrograma Counter fuera de rango\n";
-                break;
-            }
+            instrucciones++;
+            if (cpu.PC >= 0xFFFF) break;
         }
-
-        std::cout << "\nEstado final de la CPU:\n";
-        cpu.printState();
-        std::cout << "\nTotal de instrucciones ejecutadas: " << instrucciones_ejecutadas << "\n";
-    }
-
-    void printCPUState() {
-        cpu.printState();
     }
 };
 
 int main(int argc, char* argv[]) {
     GameBoy emulador;
+    std::string rom_path = "legend.gb";
+    if (argc > 1) rom_path = argv[1];
 
-    // ROM por defecto o desde argumentos
-    std::string rom_path = "cpu_instrs.gb";
-    bool debug = false;
-
-    if (argc > 1) {
-        rom_path = argv[1];
-    }
-    if (argc > 2) {
-        debug = (std::string(argv[2]) == "debug");
-    }
-
-    std::cout << "Cargando ROM: " << rom_path << "\n";
-    if (debug) std::cout << "Debug mode activado\n";
-    std::cout << "\n";
-
-    if (emulador.cargar_rom(rom_path)) {
-        emulador.ejecutar(debug);
-    } else {
-        std::cerr << "No se pudo cargar el ROM\n";
-        return 1;
-    }
-
+    if (emulador.cargar_rom(rom_path)) emulador.ejecutar();
+    else std::cerr << "ROM Fail\n";
     return 0;
 }
