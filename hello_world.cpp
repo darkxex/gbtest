@@ -79,6 +79,7 @@ public:
         flagZ = (result == 0) ? 1 : 0;
         flagN = 0;
         flagH = 0;
+        flagC = 0;
     }
 };
 
@@ -148,7 +149,9 @@ public:
 
         // 1. RENDERIZAR FONDO Y WINDOW
         if (lcdc & 0x01) { 
-        uint8_t y_pos = ly + scy;
+            uint8_t y_pos = ly + scy;
+            uint16_t tile_data_start = (lcdc & 0x10) ? 0x8000 : 0x8800;
+            bool unsigned_indices = (lcdc & 0x10);
 
         for (int x = 0; x < SCREEN_WIDTH; x++) {
             uint16_t tile_map_start;
@@ -165,9 +168,6 @@ public:
                 current_x = x + scx;
                 current_y = ly + scy;
             }
-
-            uint16_t tile_data_start = (lcdc & 0x10) ? 0x8000 : 0x8800;
-            bool unsigned_indices = (lcdc & 0x10);
 
             uint16_t tile_row = (current_y / 8) * 32;
             uint16_t tile_col = current_x / 8;
@@ -336,368 +336,391 @@ public:
     }
 };
 
-// ===================== CLASE APU (AUDIO PROCESSING UNIT) =====================
+static const uint32_t APU_DIVIDER[] = { 8, 16, 32, 48, 64, 80, 96, 112 };
+static const bool     APU_MUTE[]    = { true, false, false, false };
+static const int8_t   APU_PULSE[][8] = {
+    { -1,-1,-1,-1,-1,-1,-1, 1 },
+    { -1,-1,-1,-1,-1,-1, 1, 1 },
+    { -1,-1,-1,-1, 1, 1, 1, 1 },
+    {  1, 1, 1, 1, 1, 1,-1,-1 }
+};
+static const uint8_t APU_SHIFT[] = { 0, 0, 1, 2 };
+
 class APU {
 private:
-    uint8_t regs[0x30]; // Registros 0xFF10 - 0xFF3F
-    float sample_rate = 44100.0f;
-    float cycles_per_sample = 4194304.0f / 44100.0f;
-    float cycle_accumulator = 0;
+    struct Noise {
+        uint32_t delay = 0;
+        uint16_t sample = 0;
+        uint8_t  volume = 0;
+        struct { uint8_t raw = 0x3F;
+            uint8_t enabled() const { return (raw>>6)&1; }
+            uint8_t trigger() const { return (raw>>7)&1; }
+        } control;
+        struct { uint8_t raw = 0;
+            uint8_t period()    const { return raw&7; }
+            uint8_t direction() const { return (raw>>3)&1; }
+            uint8_t vol()       const { return raw>>4; }
+        } envelope;
+        struct { uint8_t raw = 0;
+            uint8_t divider() const { return raw&7; }
+            uint8_t width()   const { return (raw>>3)&1; }
+            uint8_t shift()   const { return raw>>4; }
+        } frequency;
+        struct { uint8_t raw = 0xC0;
+            uint8_t timer() const { return raw&0x3F; }
+        } length;
+        struct { uint8_t length = 0; uint8_t env_period = 0; } timer;
+    } noise;
 
-    // Frame Sequencer (512Hz) para Envelopes y Lengths
-    float sequencer_accumulator = 0;
-    int sequencer_step = 0;
+    struct Square1 {
+        uint32_t delay = 0;
+        uint8_t  position = 0;
+        uint8_t  volume = 0;
+        struct { uint8_t raw = 0;
+            uint8_t period()    const { return raw&7; }
+            uint8_t direction() const { return (raw>>3)&1; }
+            uint8_t vol()       const { return raw>>4; }
+        } envelope;
+        struct {
+            uint8_t low = 0;
+            struct { uint8_t raw = 0x38;
+                uint8_t period()  const { return raw&7; }
+                uint8_t enabled() const { return (raw>>6)&1; }
+                uint8_t trigger() const { return (raw>>7)&1; }
+            } high;
+        } frequency;
+        struct { uint8_t raw = 0;
+            uint8_t timer() const { return raw&0x3F; }
+            uint8_t duty()  const { return raw>>6; }
+        } length;
+        struct { uint8_t raw = 0x80;
+            uint8_t shift()     const { return raw&7; }
+            uint8_t direction() const { return (raw>>3)&1; }
+            uint8_t period()    const { return (raw>>4)&7; }
+        } sweep;
+        struct { uint8_t length=0; uint8_t env_period=0;
+                 bool sw_enabled=false; uint16_t sw_freq=0; uint8_t sw_period=0; } timer;
+    } sq1;
 
-    // Estado interno de los canales
-    bool ch1_enabled = false, ch2_enabled = false, ch3_enabled = false, ch4_enabled = false;
-    int ch1_length = 0, ch2_length = 0, ch3_length = 0, ch4_length = 0;
-    bool ch1_len_enabled = false, ch2_len_enabled = false, ch3_len_enabled = false, ch4_len_enabled = false;
+    struct Square2 {
+        uint32_t delay = 0;
+        uint8_t  position = 0;
+        uint8_t  volume = 0;
+        struct { uint8_t raw = 0;
+            uint8_t period()    const { return raw&7; }
+            uint8_t direction() const { return (raw>>3)&1; }
+            uint8_t vol()       const { return raw>>4; }
+        } envelope;
+        struct {
+            uint8_t low = 0;
+            struct { uint8_t raw = 0x38;
+                uint8_t period()  const { return raw&7; }
+                uint8_t enabled() const { return (raw>>6)&1; }
+                uint8_t trigger() const { return (raw>>7)&1; }
+            } high;
+        } frequency;
+        struct { uint8_t raw = 0;
+            uint8_t timer() const { return raw&0x3F; }
+            uint8_t duty()  const { return raw>>6; }
+        } length;
+        struct { uint8_t length=0; uint8_t env_period=0; } timer;
+    } sq2;
 
-    int ch1_env_vol = 0, ch2_env_vol = 0, ch4_env_vol = 0;
-    int ch1_env_ticks = 0, ch2_env_ticks = 0, ch4_env_ticks = 0;
+    struct Wave {
+        uint32_t delay = 0;
+        uint8_t  length_reg = 0;
+        uint8_t  position = 0;
+        struct { uint8_t raw = 0x7F;
+            uint8_t enabled() const { return (raw>>7)&1; }
+        } control;
+        struct {
+            uint8_t low = 0;
+            struct { uint8_t raw = 0x38;
+                uint8_t period()  const { return raw&7; }
+                uint8_t enabled() const { return (raw>>6)&1; }
+                uint8_t trigger() const { return (raw>>7)&1; }
+            } high;
+        } frequency;
+        struct { uint8_t raw = 0x9F;
+            uint8_t output() const { return (raw>>5)&3; }
+        } level;
+        struct { uint16_t length = 0; } timer;
+    } wave;
 
-    // Estado del Sweep (Canal 1)
-    int ch1_sweep_timer = 0;
-    uint16_t ch1_shadow_freq = 0;
-    bool ch1_sweep_enabled = false;
+    struct Ctrl { uint8_t raw = 0x70;
+        uint8_t sq1_en()   const { return (raw>>0)&1; }
+        uint8_t sq2_en()   const { return (raw>>1)&1; }
+        uint8_t wave_en()  const { return (raw>>2)&1; }
+        uint8_t noise_en() const { return (raw>>3)&1; }
+        uint8_t enabled()  const { return (raw>>7)&1; }
+        void set_sq1(bool v)   { raw = (raw & ~0x01) | (uint8_t)v; }
+        void set_sq2(bool v)   { raw = (raw & ~0x02) | ((uint8_t)v<<1); }
+        void set_wave(bool v)  { raw = (raw & ~0x04) | ((uint8_t)v<<2); }
+        void set_noise(bool v) { raw = (raw & ~0x08) | ((uint8_t)v<<3); }
+    } ctrl;
 
-    float ch1_phase = 0;
-    float ch2_phase = 0;
-    float ch3_phase = 0;
-    float ch4_phase = 0;
-    uint16_t ch4_lfsr = 0x7FFF; // Registro de desplazamiento para ruido
+    struct Mixer { uint8_t raw = 0;
+        uint8_t sq1_r()   const { return (raw>>0)&1; }
+        uint8_t sq2_r()   const { return (raw>>1)&1; }
+        uint8_t wave_r()  const { return (raw>>2)&1; }
+        uint8_t noise_r() const { return (raw>>3)&1; }
+        uint8_t sq1_l()   const { return (raw>>4)&1; }
+        uint8_t sq2_l()   const { return (raw>>5)&1; }
+        uint8_t wave_l()  const { return (raw>>6)&1; }
+        uint8_t noise_l() const { return (raw>>7)&1; }
+    } mixer;
 
-    // Estado del Filtro de Paso Alto (HPF) para eliminar DC Offset
-    float prev_sample_l = 0, prev_sample_r = 0;
-    float prev_out_l = 0, prev_out_r = 0;
+    struct Vol { uint8_t raw = 0x88;
+        uint8_t right() const { return raw & 7; }
+        uint8_t left()  const { return (raw>>4) & 7; }
+    } vol;
 
-    // Estado del Filtro de Paso Bajo (LPF) para un sonido más suave (Filtro Linear)
-    float lpf_l = 0, lpf_r = 0;
+    uint8_t  wave_ram[16] = {};
+    uint32_t cycle = 0;
 
-    float audio_buffer[256];
-    int buffer_ptr = 0;
+    static const int SAMPLE_BUF = 560;
+    int16_t  sample_buf[SAMPLE_BUF] = {};
+    uint32_t sample_idx = 0;
+    uint32_t cycle_acc  = 0;
+    uint32_t step_acc   = 0;
+
+    void trigger_noise() {
+        if (noise.control.trigger()) {
+            noise.sample = 0;
+            noise.timer.env_period = noise.envelope.period();
+            noise.timer.length     = 64 - noise.length.timer();
+            noise.volume           = noise.envelope.vol();
+            ctrl.set_noise(true);
+        }
+    }
+    void trigger_sq1() {
+        if (sq1.frequency.high.trigger()) {
+            sq1.timer.env_period = sq1.envelope.period();
+            sq1.timer.length     = 64 - sq1.length.timer();
+            sq1.timer.sw_enabled = sq1.sweep.period() || sq1.sweep.shift();
+            sq1.timer.sw_freq    = ((uint16_t)sq1.frequency.high.period()<<8) | sq1.frequency.low;
+            sq1.timer.sw_period  = sq1.sweep.period() ? sq1.sweep.period() : 8;
+            sq1.volume           = sq1.envelope.vol();
+            ctrl.set_sq1(true);
+        }
+    }
+    void trigger_sq2() {
+        if (sq2.frequency.high.trigger()) {
+            sq2.timer.env_period = sq2.envelope.period();
+            sq2.timer.length     = 64 - sq2.length.timer();
+            sq2.volume           = sq2.envelope.vol();
+            ctrl.set_sq2(true);
+        }
+    }
+    void trigger_wave() {
+        if (wave.frequency.high.trigger()) {
+            wave.position     = 0;
+            wave.timer.length = 256 - wave.length_reg;
+            ctrl.set_wave(true);
+        }
+    }
+
+    void interrupt() {
+        // Length counters
+        if (sq1.frequency.high.enabled()  && sq1.timer.length   && !--sq1.timer.length)   ctrl.set_sq1(false);
+        if (sq2.frequency.high.enabled()  && sq2.timer.length   && !--sq2.timer.length)   ctrl.set_sq2(false);
+        if (wave.frequency.high.enabled() && wave.timer.length  && !--wave.timer.length)  ctrl.set_wave(false);
+        if (noise.control.enabled()       && noise.timer.length && !--noise.timer.length) ctrl.set_noise(false);
+        // Sweep (cada 2 llamadas)
+        if (!(cycle & 1)) {
+            if (sq1.timer.sw_period && !--sq1.timer.sw_period) {
+                sq1.timer.sw_period = sq1.sweep.period() ? sq1.sweep.period() : 8;
+                if (sq1.timer.sw_enabled && sq1.sweep.period()) {
+                    uint16_t delta = sq1.timer.sw_freq >> sq1.sweep.shift();
+                    uint16_t nf = sq1.sweep.direction()
+                        ? (sq1.timer.sw_freq - delta) : (sq1.timer.sw_freq + delta);
+                    if (nf > 2047) { ctrl.set_sq1(false); }
+                    else if (sq1.sweep.shift()) {
+                        sq1.frequency.high.raw = (sq1.frequency.high.raw & 0xF8) | ((nf>>8)&7);
+                        sq1.frequency.low      = nf & 0xFF;
+                        sq1.timer.sw_freq      = nf;
+                    }
+                }
+            }
+        }
+        // Envelopes (cada 4 llamadas)
+        if (!(cycle & 3)) {
+            auto env = [](uint8_t period, uint8_t dir, uint8_t& v, uint8_t& tp) {
+                if (tp && !--tp) { tp = period;
+                    if (dir) { if (v < 15) ++v; } else { if (v) --v; } }
+            };
+            env(sq1.envelope.period(),   sq1.envelope.direction(),   sq1.volume,   sq1.timer.env_period);
+            env(sq2.envelope.period(),   sq2.envelope.direction(),   sq2.volume,   sq2.timer.env_period);
+            env(noise.envelope.period(), noise.envelope.direction(), noise.volume, noise.timer.env_period);
+        }
+        if (++cycle >= 4) cycle = 0;
+    }
+
+    void step_channels() {
+        if (!ctrl.enabled()) return;
+        if (ctrl.sq1_en()) {
+            if (!sq1.delay) {
+                sq1.delay = (2048u - (((uint32_t)sq1.frequency.high.period()<<8)|sq1.frequency.low)) * 4;
+                sq1.position = (sq1.position + 1) & 7;
+            }
+            --sq1.delay;
+        }
+        if (ctrl.sq2_en()) {
+            if (!sq2.delay) {
+                sq2.delay = (2048u - (((uint32_t)sq2.frequency.high.period()<<8)|sq2.frequency.low)) * 4;
+                sq2.position = (sq2.position + 1) & 7;
+            }
+            --sq2.delay;
+        }
+        if (ctrl.wave_en()) {
+            if (!wave.delay) {
+                wave.delay = (2048u - (((uint32_t)wave.frequency.high.period()<<8)|wave.frequency.low)) * 2;
+                wave.position = (wave.position + 1) & 31;
+            }
+            --wave.delay;
+        }
+        if (ctrl.noise_en()) {
+            if (!noise.delay) {
+                uint16_t s = 0;
+                noise.delay = APU_DIVIDER[noise.frequency.divider()] << noise.frequency.shift();
+                s = !((noise.sample & 1) ^ ((noise.sample >> 1) & 1));
+                noise.sample = (noise.sample >> 1) | (s << 14);
+                if (noise.frequency.width()) {
+                    noise.sample = (noise.sample & ~(1<<6)) | (s<<6);
+                }
+            }
+            --noise.delay;
+        }
+    }
+
+    int16_t mix_sample() {
+        if (!ctrl.enabled()) return 0;
+        int32_t left = 0, right = 0;
+        if (ctrl.sq1_en()) {
+            int32_t s = APU_PULSE[sq1.length.duty()][sq1.position] * sq1.volume;
+            if (mixer.sq1_l()) left  += s;
+            if (mixer.sq1_r()) right += s;
+        }
+        if (ctrl.sq2_en()) {
+            int32_t s = APU_PULSE[sq2.length.duty()][sq2.position] * sq2.volume;
+            if (mixer.sq2_l()) left  += s;
+            if (mixer.sq2_r()) right += s;
+        }
+        if (ctrl.wave_en() && !APU_MUTE[wave.level.output()]) {
+            uint8_t d = wave_ram[wave.position / 2];
+            d = (wave.position & 1) ? (d & 15) : (d >> 4);
+            int32_t s = ((int32_t)d * 2 - 15) >> APU_SHIFT[wave.level.output()];
+            if (mixer.wave_l()) left  += s;
+            if (mixer.wave_r()) right += s;
+        }
+        if (ctrl.noise_en()) {
+            int32_t s = ((noise.sample & 1) ? 1 : -1) * (int32_t)noise.volume;
+            if (mixer.noise_l()) left  += s;
+            if (mixer.noise_r()) right += s;
+        }
+        left  *= (vol.left()  + 1);
+        right *= (vol.right() + 1);
+        int32_t mixed = (left + right) * 32;
+        if (mixed >  32767) mixed =  32767;
+        if (mixed < -32768) mixed = -32768;
+        return (int16_t)mixed;
+    }
 
 public:
     SDL_AudioStream* stream = nullptr;
 
     APU() {
-        SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, 44100 };
+        SDL_AudioSpec spec = { SDL_AUDIO_S16, 1, 32768 };
         stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
-        if (stream) {
-            SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(stream));
-        }
-        std::memset(regs, 0, sizeof(regs));
+        if (stream) SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(stream));
     }
+    ~APU() { if (stream) SDL_DestroyAudioStream(stream); }
 
-    ~APU() {
-        if (stream) SDL_DestroyAudioStream(stream);
-    }
-
-    void write(uint16_t addr, uint8_t val) {
-        if (addr == 0xFF26) {
-            uint8_t old_power = regs[0x16] & 0x80;
-            uint8_t new_power = val & 0x80;
-            if (!(val & 0x80)) {
-                // Apagar todos los canales y limpiar registros
-                std::memset(regs, 0, 0x16); // 0xFF10 - 0xFF25
-                ch1_enabled = ch2_enabled = ch3_enabled = ch4_enabled = false;
-                ch1_phase = ch2_phase = ch3_phase = ch4_phase = 0;
-                prev_sample_l = prev_sample_r = prev_out_l = prev_out_r = 0;
-                lpf_l = lpf_r = 0;
-            }
-            regs[0x16] = new_power; 
-            return;
-        }
-
-        // Si el sonido maestro está apagado, ignorar escrituras a otros registros
-        if (!(regs[0x16] & 0x80)) return;
-
-        uint8_t reg_idx = addr - 0xFF10;
-        if (reg_idx < 0x30) regs[reg_idx] = val;
-
-        // Lógica de Length Counters y Triggers
-        switch(addr) {
-            case 0xFF1A: { // NR30 DAC Power
-                bool dac_on = val & 0x80;
-                if (!dac_on) ch3_enabled = false;
-                regs[0x0A] = val; 
-                break;
-            }
-            case 0xFF11: ch1_length = 64 - (val & 0x3F); break;
-            case 0xFF14: 
-                ch1_len_enabled = val & 0x40;
-                if (val & 0x80) trigger_ch1();
-                break;
-            case 0xFF16: ch2_length = 64 - (val & 0x3F); break;
-            case 0xFF19: 
-                ch2_len_enabled = val & 0x40;
-                if (val & 0x80) trigger_ch2(); 
-                break;
-            case 0xFF1B: ch3_length = 256 - val; break;
-            case 0xFF1E: 
-                ch3_len_enabled = val & 0x40;
-                if ((val & 0x80) && (regs[0x1A - 0xFF10] & 0x80)) { 
-                    ch3_enabled = true; 
-                    ch3_phase = 0; // Reiniciar la onda para que la nota empiece limpia
-                    if(ch3_length == 0) ch3_length = 256; 
-                }
-                break;
-            case 0xFF20: ch4_length = 64 - (val & 0x3F); break;
-            case 0xFF23: 
-                ch4_len_enabled = val & 0x40;
-                if (val & 0x80) trigger_ch4(); 
-                break;
-        }
-    }
-
-    void trigger_ch1() {
-        // El canal solo se activa si el DAC tiene energía
-        if ((regs[0x02] & 0xF8) != 0) {
-            ch1_enabled = true;
-            ch1_phase = 0;
-            ch1_env_vol = regs[0x02] >> 4;
-            ch1_env_ticks = regs[0x02] & 0x07;
-            if (ch1_length == 0) ch1_length = 64;
-        }
-
-        // Inicializar Sweep
-        ch1_shadow_freq = regs[0x03] | ((regs[0x04] & 0x07) << 8);
-        uint8_t nr10 = regs[0x00];
-        int sweep_period = (nr10 >> 4) & 0x07;
-        int sweep_shift = nr10 & 0x07;
-        ch1_sweep_timer = (sweep_period == 0) ? 8 : sweep_period;
-        ch1_sweep_enabled = (sweep_period != 0) || (sweep_shift != 0);
-    }
-
-    void update_sweep() {
-        if (ch1_sweep_timer > 0) ch1_sweep_timer--;
-
-        if (ch1_sweep_timer == 0) {
-            uint8_t nr10 = regs[0x00];
-            int sweep_period = (nr10 >> 4) & 0x07;
-            ch1_sweep_timer = (sweep_period == 0) ? 8 : sweep_period;
-
-            if (ch1_sweep_enabled && sweep_period > 0) {
-                int sweep_shift = nr10 & 0x07;
-                bool negate = nr10 & 0x08;
-                uint16_t delta = ch1_shadow_freq >> sweep_shift;
-                uint16_t new_freq = negate ? (ch1_shadow_freq - delta) : (ch1_shadow_freq + delta);
-
-                if (new_freq > 2047) {
-                    ch1_enabled = false;
-                } else if (sweep_shift > 0) {
-                    ch1_shadow_freq = new_freq;
-                    regs[0x03] = new_freq & 0xFF;
-                    regs[0x04] = (regs[0x04] & 0xF8) | ((new_freq >> 8) & 0x07);
+    void tick(int cycles) {
+        for (int i = 0; i < cycles; i++) {
+            step_channels();
+            if (++step_acc >= 8192) { step_acc -= 8192; interrupt(); }
+            if (++cycle_acc >= 128) {
+                cycle_acc -= 128;
+                sample_buf[sample_idx++] = mix_sample();
+                if (sample_idx >= SAMPLE_BUF) {
+                    if (stream) {
+                        while (SDL_GetAudioStreamQueued(stream) > SAMPLE_BUF * 2 * (int)sizeof(int16_t))
+                            SDL_Delay(1);
+                        SDL_PutAudioStreamData(stream, sample_buf, sample_idx * sizeof(int16_t));
+                    }
+                    sample_idx = 0;
                 }
             }
-        }
-    }
-
-    void trigger_ch2() {
-        if ((regs[0x07] & 0xF8) != 0) {
-            ch2_enabled = true;
-            ch2_env_vol = regs[0x07] >> 4;
-            ch2_env_ticks = regs[0x07] & 0x07;
-            if (ch2_length == 0) ch2_length = 64;
-        }
-    }
-
-    void trigger_ch4() {
-        if ((regs[0x11] & 0xF8) != 0) {
-            ch4_enabled = true;
-            ch4_env_vol = regs[0x11] >> 4;
-            ch4_env_ticks = regs[0x11] & 0x07;
-            if (ch4_length == 0) ch4_length = 64;
         }
     }
 
     uint8_t read(uint16_t addr) {
-        if (addr == 0xFF26) { // NR52: Retornar el estado real de los canales
-            uint8_t power = regs[0x16] & 0x80;
-            if (!power) return 0x70; // Si no hay energía, los estados son 0
-            // Se añade cast a uint8_t para evitar el warning C4805
-            return power | (ch4_enabled << 3) | (ch3_enabled << 2) | (ch2_enabled << 1) | (uint8_t)ch1_enabled | 0x70; 
-        }
-        if (addr >= 0xFF30 && addr <= 0xFF3F) {
-            return regs[addr - 0xFF10]; // Wave RAM
-        }
-        return regs[addr - 0xFF10] | 0xFF;
-    }
-
-    void tick(int cycles) {
-        cycle_accumulator += cycles;
-        sequencer_accumulator += cycles;
-
-        // El Frame Sequencer corre a 512Hz
-        if (sequencer_accumulator >= 8192) { // 4MHz / 512 = 8192
-            sequencer_accumulator -= 8192;
-            step_sequencer();
-        }
-
-        while (cycle_accumulator >= cycles_per_sample) {
-            generate_sample();
-            cycle_accumulator -= cycles_per_sample;
+        switch (addr) {
+            case 0xFF10: return sq1.sweep.raw;
+            case 0xFF11: return sq1.length.raw;
+            case 0xFF12: return sq1.envelope.raw;
+            case 0xFF14: return sq1.frequency.high.raw;
+            case 0xFF16: return sq2.length.raw;
+            case 0xFF17: return sq2.envelope.raw;
+            case 0xFF19: return sq2.frequency.high.raw;
+            case 0xFF1A: return wave.control.raw;
+            case 0xFF1B: return wave.length_reg;
+            case 0xFF1C: return wave.level.raw;
+            case 0xFF1E: return wave.frequency.high.raw;
+            case 0xFF20: return noise.length.raw;
+            case 0xFF21: return noise.envelope.raw;
+            case 0xFF22: return noise.frequency.raw;
+            case 0xFF23: return noise.control.raw;
+            case 0xFF24: return vol.raw;
+            case 0xFF25: return mixer.raw;
+            case 0xFF26: return ctrl.enabled() ? (ctrl.raw | 0x70) : 0x70;
+            default:
+                if (addr >= 0xFF30 && addr <= 0xFF3F) return wave_ram[addr - 0xFF30];
+                return 0xFF;
         }
     }
 
-    void step_sequencer() {
-        sequencer_step = (sequencer_step + 1) % 8;
-        
-        // Contadores de Longitud (256Hz) - Se ejecutan en pasos pares
-        if (sequencer_step % 2 == 0) {
-            if (ch1_len_enabled && ch1_length > 0) { if (--ch1_length == 0) ch1_enabled = false; }
-            if (ch2_len_enabled && ch2_length > 0) { if (--ch2_length == 0) ch2_enabled = false; }
-            if (ch3_len_enabled && ch3_length > 0) { if (--ch3_length == 0) ch3_enabled = false; }
-            if (ch4_len_enabled && ch4_length > 0) { if (--ch4_length == 0) ch4_enabled = false; }
+    void write(uint16_t addr, uint8_t val) {
+        if (addr == 0xFF26) {
+            bool was_on = ctrl.enabled();
+            ctrl.raw = (ctrl.raw & 0x7F) | (val & 0x80);
+            if (was_on && !ctrl.enabled()) {
+                noise = {}; sq1 = {}; sq2 = {}; wave = {};
+                mixer.raw = 0; vol.raw = 0; ctrl.raw = 0x70;
+            }
+            return;
         }
-
-        // Sweep (128Hz) - Pasos 2 y 6
-        if (sequencer_step == 2 || sequencer_step == 6) {
-            update_sweep();
-        }
-
-        // Cada 64Hz (paso 7) actualizamos los Envelopes
-        if (sequencer_step == 7) {
-            auto update_env = [](uint8_t reg, int& vol, int& ticks) {
-                int sweep_pace = reg & 0x07;
-                if (sweep_pace == 0) return;
-                if (ticks > 0) {
-                    ticks--;
-                    if (ticks == 0) {
-                        ticks = sweep_pace;
-                        bool inc = reg & 0x08;
-                        if (inc && vol < 15) vol++;
-                        else if (!inc && vol > 0) vol--;
-                    }
-                }
-            };
-            update_env(regs[0x02], ch1_env_vol, ch1_env_ticks);
-            update_env(regs[0x07], ch2_env_vol, ch2_env_ticks);
-            update_env(regs[0x11], ch4_env_vol, ch4_env_ticks);
-        }
-    }
-
-    void generate_sample() {
-        if (!stream) return;
-
-        float left = 0.0f, right = 0.0f;
-        const float duty_lookup[] = { 0.125f, 0.25f, 0.50f, 0.75f };
-
-        // NR50 (0xFF24) Control de volumen maestro
-        float master_vol_l = ((regs[0x14] >> 4) & 0x07) / 7.0f;
-        float master_vol_r = (regs[0x14] & 0x07) / 7.0f;
-
-        // NR51 (0xFF25) Panning
-        uint8_t panning = regs[0x15];
-
-        // NR52 (0xFF26) Bit 7 es el interruptor maestro de sonido
-        if (regs[0x16] & 0x80) {
-            // Canal 1
-            uint16_t freq1 = regs[0x03] | ((regs[0x04] & 0x07) << 8);
-            if (ch1_enabled && freq1 > 0) {
-                float f = 131072.0f / (2048.0f - freq1);
-                ch1_phase += f / sample_rate;
-                if (ch1_phase > 1.0f) ch1_phase -= 1.0f;
-                float duty = duty_lookup[regs[0x01] >> 6];
-                float val = (ch1_phase < duty ? 1.0f : -1.0f) * (ch1_env_vol / 15.0f) * 0.1f;
-                if (panning & 0x10) left += val;
-                if (panning & 0x01) right += val;
-            }
-            // Canal 2
-            uint16_t freq2 = regs[0x08] | ((regs[0x09] & 0x07) << 8);
-            if (ch2_enabled && freq2 > 0) {
-                float f = 131072.0f / (2048.0f - freq2);
-                ch2_phase += f / sample_rate;
-                if (ch2_phase > 1.0f) ch2_phase -= 1.0f;
-                float duty = duty_lookup[regs[0x06] >> 6];
-                float val = (ch2_phase < duty ? 1.0f : -1.0f) * (ch2_env_vol / 15.0f) * 0.1f;
-                if (panning & 0x20) left += val;
-                if (panning & 0x02) right += val;
-            }
-            // Canal 3 (Bajo / Wave RAM) - Corrección de DC Offset
-            uint8_t nr30 = regs[0x0A]; // NR30 (0xFF1A)
-            if (ch3_enabled && (nr30 & 0x80)) {
-                uint16_t freq3 = regs[0x0D] | ((regs[0x0E] & 0x07) << 8); // 0xFF1D y 0xFF1E
-                if (freq3 < 2048) {
-                    float f = 2097152.0f / (2048.0f - freq3);
-                    ch3_phase += (f / 32.0f) / sample_rate;
-                    if (ch3_phase > 1.0f) ch3_phase -= 1.0f;
-                    
-                    int sample_idx = (int)(ch3_phase * 32.0f) & 31;
-
-                    uint8_t wave_byte = regs[(0xFF30 + (sample_idx / 2)) - 0xFF10];
-                    uint8_t wave_sample = (sample_idx % 2 == 0) ? (wave_byte >> 4) : (wave_byte & 0x0F);
-                    
-                    // 1. Centrar la muestra (0..15) a (-1.0..1.0) PRIMERO
-                    float centered_sample = ((float)wave_sample - 7.5f) / 7.5f;
-
-                    // 2. Aplicar el volumen (shift) de forma multiplicativa
-                    int shift = (regs[0x0C] >> 5) & 0x03; // NR32 (0xFF1C)
-                    float volume = 0.0f;
-                    if (shift == 1)      volume = 1.0f;  // 100%
-                    else if (shift == 2) volume = 0.5f;  // 50%
-                    else if (shift == 3) volume = 0.25f; // 25%
-                    
-                    if (volume > 0) {
-                        float val = (centered_sample * volume) * 0.10f;
-                        if (panning & 0x40) left += val;
-                        if (panning & 0x04) right += val;
-                    }
-                }
-            }
-            // Canal 4
-            uint8_t nr43 = regs[0xFF22 - 0xFF10];
-            float s = (nr43 >> 4) & 0x0F;
-            float r = (nr43 & 0x07);
-            if (r == 0) r = 0.5f;
-            float f_noise = 524288.0f / r / (float)(1 << (int)(s + 1));
-
-            ch4_phase += f_noise / sample_rate;
-            while (ch4_phase > 1.0f) {
-                ch4_phase -= 1.0f;
-                // Lógica de LFSR para generar ruido blanco
-                uint16_t result = (ch4_lfsr & 1) ^ ((ch4_lfsr >> 1) & 1);
-                ch4_lfsr = (ch4_lfsr >> 1) | (result << 14);
-                if (nr43 & 0x08) { // Modo de paso corto (7 bits)
-                    ch4_lfsr = (ch4_lfsr & ~0x40) | (result << 6);
-                }
-            }
-            if (ch4_enabled && ch4_env_vol > 0) {
-                float val = ((ch4_lfsr & 1) ? 1.0f : -1.0f) * (ch4_env_vol / 15.0f) * 0.05f;
-                if (panning & 0x80) left += val;
-                if (panning & 0x08) right += val;
-            }
-        }
-
-        float mixed_l = left * master_vol_l;
-        float mixed_r = right * master_vol_r;
-
-        // Aplicar Filtro de Paso Alto (capacitor de salida)
-        // Esto centra la onda en el cero dinámicamente, eliminando el zumbido de DC.
-        prev_out_l = mixed_l - prev_sample_l + 0.996f * prev_out_l;
-        prev_out_r = mixed_r - prev_sample_r + 0.996f * prev_out_r;
-        prev_sample_l = mixed_l;
-        prev_sample_r = mixed_r;
-
-        // Aplicar Filtro de Paso Bajo (LPF) - Suavizado linear
-        // Esto elimina los armónicos más agudos y estridentes, dando un tono más analógico.
-        lpf_l += (prev_out_l - lpf_l) * 0.6f;
-        lpf_r += (prev_out_r - lpf_r) * 0.6f;
-
-        audio_buffer[buffer_ptr++] = lpf_l;
-        audio_buffer[buffer_ptr++] = lpf_r;
-        if (buffer_ptr >= 256) {
-            // Sincronización: si la cola de SDL tiene más de ~20ms de audio, esperamos
-            // 44100 muestras/seg * 2 canales * 4 bytes/muestra * 0.020 seg = ~7056 bytes
-            while (SDL_GetAudioStreamQueued(stream) > 7056) {
-                SDL_Delay(1);
-            }
-            SDL_PutAudioStreamData(stream, audio_buffer, buffer_ptr * sizeof(float));
-            buffer_ptr = 0;
+        if (addr >= 0xFF30 && addr <= 0xFF3F) { wave_ram[addr - 0xFF30] = val; return; }
+        if (!ctrl.enabled()) return;
+        switch (addr) {
+            case 0xFF10: sq1.sweep.raw        = val | 0x80; break;
+            case 0xFF11: sq1.length.raw       = val;        break;
+            case 0xFF12: sq1.envelope.raw     = val;        break;
+            case 0xFF13: sq1.frequency.low    = val;        break;
+            case 0xFF14: sq1.frequency.high.raw = val | 0x38; trigger_sq1(); break;
+            case 0xFF16: sq2.length.raw       = val;        break;
+            case 0xFF17: sq2.envelope.raw     = val;        break;
+            case 0xFF18: sq2.frequency.low    = val;        break;
+            case 0xFF19: sq2.frequency.high.raw = val | 0x38; trigger_sq2(); break;
+            case 0xFF1A:
+                wave.control.raw = val | 0x7F;
+                if (!wave.control.enabled()) ctrl.set_wave(false);
+                break;
+            case 0xFF1B: wave.length_reg        = val;        break;
+            case 0xFF1C: wave.level.raw         = val | 0x9F; break;
+            case 0xFF1D: wave.frequency.low     = val;        break;
+            case 0xFF1E: wave.frequency.high.raw = val | 0x38; trigger_wave(); break;
+            case 0xFF20: noise.length.raw       = val | 0xC0; break;
+            case 0xFF21: noise.envelope.raw     = val;        break;
+            case 0xFF22: noise.frequency.raw    = val;        break;
+            case 0xFF23: noise.control.raw      = val | 0x3F; trigger_noise(); break;
+            case 0xFF24: vol.raw                = val;        break;
+            case 0xFF25: mixer.raw              = val;        break;
         }
     }
 };
+
 
 // ===================== CLASE TIMER =====================
 class Timer {
@@ -740,9 +763,27 @@ class GameBoy {
 private:
     // Memoria del sistema (64 KB)
     std::vector<uint8_t> memory;
-    // Buffer para la ROM (soporta hasta 64KB para este test)
+    // Buffer para la ROM y RAM externa del cartucho
     std::vector<uint8_t> rom;
-    uint8_t current_bank; // Para soporte básico de MBC1
+    std::vector<uint8_t> ext_ram;
+
+    // Información del Cartucho
+    uint32_t rom_banks_mask;
+    uint32_t ram_banks_mask;
+    uint8_t mbc_type; // Tipo de MBC detectado del header (0=NONE, 1=MBC1, 3=MBC3)
+
+    // Registros de control MBC1
+    uint8_t rom_bank_low;  // 5 bits bajos
+    uint8_t rom_bank_high; // 2 bits altos (o banco de RAM)
+    bool ram_enabled_flag;
+    uint8_t banking_mode;  // 0 = ROM Banking, 1 = RAM Banking
+
+    // Registros de control MBC3
+    uint8_t mbc3_rom_bank;  // Banco de ROM (7 bits, 0x01-0x7F)
+    uint8_t mbc3_ram_bank;  // Banco de RAM (0x00-0x03) o registro RTC (0x08-0x0C)
+
+    // Nombre del archivo de guardado
+    std::string save_path;
     
     // Estado del Joypad (Bits 0-3, 0 = presionado)
     uint8_t joypad_buttons;    // A, B, Select, Start
@@ -788,7 +829,8 @@ private:
                 if (pressed) joypad_buttons &= ~(1 << bit);
                 else joypad_buttons |= (1 << bit);
             }
-            // Tetris no usa interrupción de Joypad, prefiere polling.
+            // Solicitar interrupción de Joypad (Bit 4)
+            if (pressed) memory[REG_IF] |= 0x10;
         }
     }
 
@@ -805,11 +847,11 @@ private:
             switch (addr) {
                 case REG_JOYP: {
                     uint8_t select = memory[REG_JOYP] & 0x30; 
-            uint8_t res = 0x0F;
-            if (!(select & 0x10)) res &= joypad_directions; // P14 seleccionado
-            if (!(select & 0x20)) res &= joypad_buttons;    // P15 seleccionado
-            return 0xC0 | select | res;
-        }
+                    uint8_t res = 0x0F;
+                    if (!(select & 0x10)) res &= joypad_directions; // P14 seleccionado
+                    if (!(select & 0x20)) res &= joypad_buttons;    // P15 seleccionado
+                    return 0xC0 | select | res;
+                }
                 // DIV incrementa cada 256 T-states (16384Hz)
                 case REG_DIV:  return (timer.div_counter >> 8) & 0xFF;
                 case REG_TIMA: return timer.tima;
@@ -832,13 +874,56 @@ private:
         }
 
         // 2. Registro de Habilitación de Interrupciones
-        if (addr == REG_IE) return memory[REG_IE]; // No enmascarar IE para tests de Blargg
+        if (addr == REG_IE) return memory[REG_IE];
 
-        // 3. Mapeo de Memoria (ROM / RAM)
-        if (addr <= 0x3FFF) return rom[addr];
-        if (addr >= 0x4000 && addr <= 0x7FFF) {
-            uint32_t offset = (addr - 0x4000) + (current_bank * 0x4000);
-            return rom[offset % rom.size()];
+        // 3. Mapeo de Memoria segun tipo de MBC
+        if (mbc_type == 3 || mbc_type == 5) {
+            // === MBC3 ===
+            if (addr <= 0x3FFF) {
+                if (rom.empty()) return 0xFF;
+                return rom[addr % rom.size()];
+            }
+            
+            if (addr >= 0x4000 && addr <= 0x7FFF) {
+                if (rom.empty()) return 0xFF;
+                uint32_t bank = mbc3_rom_bank & rom_banks_mask;
+                if (bank == 0) bank = 1;
+                uint32_t offset = (addr - 0x4000) + (bank * 0x4000);
+                return rom[offset % rom.size()];
+            }
+            if (addr >= 0xA000 && addr <= 0xBFFF) {
+                if (!ram_enabled_flag) return 0xFF;
+                // Banco de RAM normal (0x00-0x03)
+                if (mbc3_ram_bank <= 0x03) {
+                    if (ext_ram.empty()) return 0xFF;
+                    uint32_t offset = (addr - 0xA000) + (mbc3_ram_bank * 0x2000);
+                    return ext_ram[offset % ext_ram.size()];
+                }
+                // Registros RTC (0x08-0x0C) - devolver 0 si no hay RTC implementado
+                return 0x00;
+            }
+        } else {
+            // === MBC1 (y MBC0/sin MBC) ===
+            if (addr <= 0x3FFF) {
+                if (rom.empty()) return 0xFF;
+                uint32_t bank = (banking_mode == 1) ? ((rom_bank_high << 5) & rom_banks_mask) : 0;
+                uint32_t offset = (bank * 0x4000) + addr;
+                return rom[offset % rom.size()];
+            }
+            if (addr >= 0x4000 && addr <= 0x7FFF) {
+                if (rom.empty()) return 0xFF;
+                uint32_t bank = (banking_mode == 0) ? (rom_bank_high << 5) | rom_bank_low : rom_bank_low;
+                if (rom_bank_low == 0) bank |= 1;
+                bank &= rom_banks_mask;
+                uint32_t offset = (addr - 0x4000) + (bank * 0x4000);
+                return rom[offset % rom.size()];
+            }
+            if (addr >= 0xA000 && addr <= 0xBFFF) {
+                if (!ram_enabled_flag || ext_ram.empty()) return 0xFF;
+                uint32_t bank = (banking_mode == 1) ? (rom_bank_high & 0x03) & ram_banks_mask : 0;
+                uint32_t offset = (addr - 0xA000) + (bank * 0x2000);
+                return ext_ram[offset % ext_ram.size()];
+            }
         }
 
         if (addr >= 0x8000 && addr <= 0xFFFF) {
@@ -858,11 +943,9 @@ private:
                 case REG_JOYP: memory[REG_JOYP] = (value & 0x30); break;
                 case REG_SB:   memory[REG_SB] = value; break;
                 case REG_SC: {
-                    // Restaurar salida de depuración para ver resultados de Blargg
                     if (value == 0x81) {
                         std::cout << (char)memory[REG_SB] << std::flush;
                     }
-
                     memory[REG_SC] = value;
                     if ((value & 0x81) == 0x81) {
                         memory[REG_SB] = 0xFF;
@@ -871,7 +954,7 @@ private:
                     }
                     break;
                 }
-                case REG_DIV:  timer.div_counter = 0; timer.tima_counter = 0; break; // Escribir en DIV resetea el contador
+                case REG_DIV:  timer.div_counter = 0; timer.tima_counter = 0; break;
                 case REG_TIMA: timer.tima = value; break;
                 case REG_TMA:  timer.tma = value; break;
                 case REG_TAC:  timer.tac = value; break;
@@ -888,11 +971,11 @@ private:
                 case REG_WY:   ppu.wy = value; break;
                 case REG_WX:   ppu.wx = value; break;
                 case REG_DMA: {
-            uint16_t source = value << 8;
-            for (int i = 0; i < 0xA0; i++) {
-                uint8_t data = readMem(source + i);
-                memory[0xFE00 + i] = data; 
-            }
+                    uint16_t source = value << 8;
+                    for (int i = 0; i < 0xA0; i++) {
+                        uint8_t data = readMem(source + i);
+                        memory[0xFE00 + i] = data; 
+                    }
                     break;
                 }
                 default: memory[addr] = value; break;
@@ -903,14 +986,72 @@ private:
         // 2. Registro de Habilitación de Interrupciones
         if (addr == REG_IE) { memory[REG_IE] = value; return; }
 
-        // Escritura en área de control MBC1
-        if (addr >= 0x2000 && addr <= 0x3FFF) {
-            current_bank = value & 0x1F;
-            if (current_bank == 0) current_bank = 1;
-            return;
+        if (mbc_type == 3 || mbc_type == 5){
+            // === CONTROLADOR MBC3 ===
+            if (addr <= 0x1FFF) { // RAM y RTC Enable
+                ram_enabled_flag = ((value & 0x0F) == 0x0A);
+                return;
+            }
+            if (addr >= 0x2000 && addr <= 0x3FFF) { // ROM Bank Number (7 bits)
+                mbc3_rom_bank = value & 0x7F;
+                if (mbc3_rom_bank == 0) mbc3_rom_bank = 1;
+                return;
+            }
+            if (addr >= 0x4000 && addr <= 0x5FFF) { // RAM Bank / RTC Register Select
+                mbc3_ram_bank = value & 0x0F; // 0x00-0x03 = RAM, 0x08-0x0C = RTC
+                return;
+            }
+            if (addr >= 0x6000 && addr <= 0x7FFF) { // Latch Clock Data (RTC) - ignorar
+                return;
+            }
+            if (addr >= 0xA000 && addr <= 0xBFFF) {
+                if (!ram_enabled_flag) return;
+                if (mbc3_ram_bank <= 0x03) {
+                    if (ext_ram.empty()) return;
+                    uint32_t offset = (addr - 0xA000) + (mbc3_ram_bank * 0x2000);
+                    if (offset < ext_ram.size()) ext_ram[offset] = value;
+                }
+                // Escritura a RTC ignorada
+                return;
+            }
+            if (addr >= 0x2000 && addr <= 0x2FFF) { // Byte bajo del banco ROM
+                mbc3_rom_bank = (mbc3_rom_bank & 0x100) | value;
+                return;
+            }
+            if (addr >= 0x3000 && addr <= 0x3FFF) { // Bit 8 del banco ROM
+                mbc3_rom_bank = (mbc3_rom_bank & 0xFF) | ((value & 0x01) << 8);
+                return;
+            }
+        } else {
+            // === CONTROLADOR MBC1 ===
+            if (addr <= 0x1FFF) {
+                ram_enabled_flag = ((value & 0x0F) == 0x0A);
+                return;
+            }
+            if (addr >= 0x2000 && addr <= 0x3FFF) {
+                rom_bank_low = value & 0x1F;
+                if (rom_bank_low == 0) rom_bank_low = 1;
+                return;
+            }
+            if (addr >= 0x4000 && addr <= 0x5FFF) {
+                rom_bank_high = value & 0x03;
+                return;
+            }
+            if (addr >= 0x6000 && addr <= 0x7FFF) {
+                banking_mode = value & 0x01;
+                return;
+            }
+            if (addr >= 0xA000 && addr <= 0xBFFF) {
+                if (ram_enabled_flag && !ext_ram.empty()) {
+                    uint32_t bank = (banking_mode == 1) ? (rom_bank_high & 0x03) & ram_banks_mask : 0;
+                    uint32_t offset = (addr - 0xA000) + (bank * 0x2000);
+                    ext_ram[offset % ext_ram.size()] = value;
+                }
+                return;
+            }
         }
 
-        // Mapeo de escritura (No se puede escribir en ROM)
+        // Escritura en VRAM/WRAM/HRAM (no se puede escribir en ROM)
         if (addr >= 0x8000 && addr <= 0xFFFF) {
             memory[addr] = value;
         }
@@ -1302,12 +1443,12 @@ private:
             }
             case 0xAE: {
                 cpu.A ^= readMem(cpu.getHL());
-                cpu.setFlagsZN(cpu.A); cpu.flagH = 0; cpu.flagC = 0;
+                cpu.setFlagsZN(cpu.A);
                 cpu.cycles = 8; break;
             }
             case 0xB6: {
                 cpu.A |= readMem(cpu.getHL());
-                cpu.setFlagsZN(cpu.A); cpu.flagH = 0; cpu.flagC = 0;
+                cpu.setFlagsZN(cpu.A);
                 cpu.cycles = 8; break;
             }
             case 0xBE: { // CP (HL)
@@ -1957,7 +2098,13 @@ private:
     }
 
 public:
-    GameBoy() : memory(0x10000, 0), current_bank(1), joypad_buttons(0x0F), joypad_directions(0x0F) {}
+    GameBoy() : memory(0x10000, 0), rom_bank_low(1), rom_bank_high(0), 
+                ram_enabled_flag(false), banking_mode(0),
+                mbc_type(1), mbc3_rom_bank(1), mbc3_ram_bank(0),
+                joypad_buttons(0x0F), joypad_directions(0x0F),
+                rom_banks_mask(0), ram_banks_mask(0) {
+        ext_ram.resize(0x8000, 0xFF); // 32KB de RAM inicializada en 0xFF (como el hardware)
+    }
 
     bool cargar_rom(const std::string& ruta_archivo) {
         std::ifstream archivo(ruta_archivo, std::ios::binary | std::ios::ate);
@@ -1965,7 +2112,70 @@ public:
         std::streamsize tamano = archivo.tellg();
         archivo.seekg(0, std::ios::beg);
         rom.resize(static_cast<size_t>(tamano));
-        return (bool)archivo.read(reinterpret_cast<char*>(rom.data()), tamano);
+
+        if (!archivo.read(reinterpret_cast<char*>(rom.data()), tamano)) return false;
+
+        // Calcular máscaras para evitar accesos fuera de rango (Potencia de 2)
+        uint32_t num_rom_banks = (uint32_t)tamano / 0x4000;
+        rom_banks_mask = num_rom_banks > 0 ? num_rom_banks - 1 : 0;
+
+        // Detectar tipo de MBC desde el header del cartucho (byte 0x0147)
+        uint8_t cart_type = (rom.size() > 0x0147) ? rom[0x0147] : 0x00;
+        switch (cart_type) {
+    case 0x0F: case 0x10: case 0x11: case 0x12: case 0x13:
+        mbc_type = 3; // MBC3
+        break;
+    case 0x01: case 0x02: case 0x03:
+        mbc_type = 1; // MBC1
+        break;
+    case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E:
+        mbc_type = 5; // MBC5  <-- AGREGAR ESTO
+        break;
+    default:
+        mbc_type = 0;
+        break;
+}
+
+        // Detectar tamaño de RAM externa (byte 0x0149)
+        uint8_t ram_size_code = (rom.size() > 0x0149) ? rom[0x0149] : 0x00;
+        size_t ram_size = 0;
+        switch (ram_size_code) {
+            case 0x01: ram_size = 0x800;   break; // 2KB
+            case 0x02: ram_size = 0x2000;  break; // 8KB
+            case 0x03: ram_size = 0x8000;  break; // 32KB (4 bancos)
+            case 0x04: ram_size = 0x20000; break; // 128KB (16 bancos)
+            case 0x05: ram_size = 0x10000; break; // 64KB (8 bancos)
+            default:   ram_size = 0x8000;  break; // Por defecto 32KB para Pokémon
+        }
+        ram_banks_mask = (uint32_t)(ram_size / 0x2000);
+        if (ram_banks_mask > 0) ram_banks_mask--;
+
+        ext_ram.resize(ram_size, 0xFF);
+
+        // Imprimir info del cartucho
+        std::cerr << "[Cartucho] Tipo MBC: " << (int)mbc_type 
+                  << " (code=0x" << std::hex << (int)cart_type << std::dec << ")"
+                  << ", Bancos ROM: " << num_rom_banks
+                  << ", RAM: " << ram_size << " bytes\n";
+
+        // Intentar cargar save file (.sav)
+        save_path = ruta_archivo.substr(0, ruta_archivo.find_last_of('.')) + ".sav";
+        std::ifstream save_file(save_path, std::ios::binary);
+        if (save_file.is_open()) {
+            save_file.read(reinterpret_cast<char*>(ext_ram.data()), ext_ram.size());
+            std::cerr << "[Save] Partida cargada desde: " << save_path << "\n";
+        }
+
+        return true;
+    }
+
+    void guardar_partida() {
+        if (save_path.empty() || ext_ram.empty()) return;
+        std::ofstream save_file(save_path, std::ios::binary);
+        if (save_file.is_open()) {
+            save_file.write(reinterpret_cast<const char*>(ext_ram.data()), ext_ram.size());
+            std::cerr << "[Save] Partida guardada en: " << save_path << "\n";
+        }
     }
 
     void ejecutar() {
@@ -1975,20 +2185,33 @@ public:
         uint64_t frame_start_time = SDL_GetTicks();
         const int CYCLES_PER_FRAME = 70224; // 154 líneas * 456 ciclos
         frame_cycles = 0;
+        uint64_t last_autosave = SDL_GetTicks();
 
         while (corriendo) {
             if (instrucciones % 100 == 0) {
                 SDL_Event event;
                 while (SDL_PollEvent(&event)) {
-                    if (event.type == SDL_EVENT_QUIT) corriendo = false;
+                    if (event.type == SDL_EVENT_QUIT) {
+                        guardar_partida();
+                        corriendo = false;
+                    }
                     else if (event.type == SDL_EVENT_KEY_DOWN) {
                         if (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT)) {
                             ppu.toggle_fullscreen();
+                        } else if (event.key.key == SDLK_F5) {
+                            guardar_partida(); // Guardar manual con F5
                         } else {
                             manejar_teclado(event.key.key, true);
                         }
                     }
                     else if (event.type == SDL_EVENT_KEY_UP) manejar_teclado(event.key.key, false);
+                }
+
+                // Autoguardado cada 60 segundos
+                uint64_t now_ms = SDL_GetTicks();
+                if (now_ms - last_autosave > 60000) {
+                    guardar_partida();
+                    last_autosave = now_ms;
                 }
             }
 
@@ -2004,14 +2227,15 @@ public:
                 frame_start_time = SDL_GetTicks();
             }
             instrucciones++;
-            if (cpu.PC >= 0xFFFF) break;
+            if (cpu.PC >= 0x10000) break;
         }
+        guardar_partida(); // Guardar al terminar
     }
 };
 
 int main(int argc, char* argv[]) {
     GameBoy emulador;
-    std::string rom_path = "legend.gb";
+    std::string rom_path = "tetris.gb";
     if (argc > 1) rom_path = argv[1];
 
     if (emulador.cargar_rom(rom_path)) emulador.ejecutar();
